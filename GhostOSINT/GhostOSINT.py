@@ -1,6 +1,7 @@
 """
 ================================================================
  GHOST OSINT FRAMEWORK v0.1.1 (Alpha) - GUI EDITION
+ GHOST OSINT FRAMEWORK v0.1.2 (Alpha) - GUI EDITION
  by TarikPro43391
 ================================================================
 Modüller:
@@ -36,7 +37,9 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import webbrowser
+import os
 import base64
+import csv
 
 try:
     import requests
@@ -69,8 +72,49 @@ try:
 except ImportError:
     CV2_OK = False
 
+# ================= CONFIG & TABS =================
+CONFIG_FILE = "ghost_osint_config.json"
+
+ALL_TAB_DEFS = [
+    ("discord", "DISCORD ID"), ("ip", "IP LOOKUP"), ("domain", "DOMAIN/DNS"),
+    ("username", "USERNAME"), ("email", "EMAIL"), ("hash", "HASH"),
+    ("phone", "PHONE"), ("url", "URL/QR"), ("exif", "EXIF"),
+    ("mac", "MAC VENDOR"), ("ua", "USER-AGENT"), ("subdomain", "SUBDOMAIN"),
+    ("wayback", "WAYBACK"), ("breach", "BREACH"), ("portscan", "PORT SCAN"),
+    ("leak", "LEAK SEARCH"), ("pastebin", "PASTEBIN"),
+    ("invite", "INVITE"), ("ssl", "SSL"), ("iban", "IBAN"),
+    ("bin", "BIN LOOKUP"), ("xss", "XSS"), ("sql", "SQLi")
+]
+
+def get_default_config():
+    """Returns the default application configuration."""
+    return {
+        "visible_tabs": [name for name, text in ALL_TAB_DEFS]
+    }
+
+def load_config():
+    """Loads configuration from the JSON file, or returns default if not found/invalid."""
+    if not os.path.exists(CONFIG_FILE):
+        return get_default_config()
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        if not isinstance(config, dict) or "visible_tabs" not in config or not isinstance(config["visible_tabs"], list):
+             return get_default_config()
+        return config
+    except (json.JSONDecodeError, IOError):
+        return get_default_config()
+
+def save_config(config):
+    """Saves the configuration dictionary to the JSON file."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4)
+    except IOError as e:
+        messagebox.showerror("Hata", f"Ayarlar kaydedilemedi: {e}")
+
 # ================= VERSION =================
-CURRENT_VERSION = "v0.1.1"
+CURRENT_VERSION = "v0.1.2"
 # Gerçek bir repo URL'si ile değiştirin. version.json dosyası {"latest_version": "vX.Y.Z", "release_url": "..."} formatında olmalı.
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/TarikPro43391/GHOST-OSINT-FRAMEWORK/main/version.json"
 
@@ -199,9 +243,9 @@ def fetch_discord_public_profile(user_id: str, token: str) -> dict:
 
     if r.status_code == 401:
         raise RuntimeError(
-            "Token geçersiz veya yetkisiz (401). Kontrol et: token'ı 'Bot ' öneki OLMADAN "
-            "yapıştır (kod zaten kendisi ekliyor), token'ın önünde/sonunda boşluk/yeni satır "
-            "olmamalı, ve token Discord Developer Portal'dan resetlenmemiş olmalı."
+            "Token geçersiz veya yetkisiz (401). Kontrol edin: Token'ın doğru olduğundan, "
+            "önünde/sonunda boşluk olmadığından ve Discord Developer Portal'dan "
+            "resetlenmediğinden emin olun. ('Bot ' önekini ekleseniz de olur, kod bunu yönetir.)"
         )
     if r.status_code == 404:
         raise RuntimeError("Kullanıcı bulunamadı (404). ID'yi kontrol et.")
@@ -545,9 +589,27 @@ def decode_qr(path: str) -> str:
 
 
 def _gps_to_decimal(coord, ref):
-    degrees, minutes, seconds = coord
-    dec = float(degrees) + float(minutes) / 60 + float(seconds) / 3600
-    if ref in ("S", "W"):
+    """Converts GPS coordinate from EXIF (DMS) to decimal degrees."""
+    if not isinstance(coord, (list, tuple)) or len(coord) != 3:
+        return None
+
+    def to_float(r):
+        """Converts an EXIF value (which can be an IFDRational) to float."""
+        if hasattr(r, 'numerator') and hasattr(r, 'denominator'):
+            if r.denominator == 0:
+                return 0.0
+            return r.numerator / r.denominator
+        return float(r)
+
+    try:
+        degrees = to_float(coord[0])
+        minutes = to_float(coord[1])
+        seconds = to_float(coord[2])
+    except (ValueError, TypeError, IndexError):
+        return None
+
+    dec = degrees + (minutes / 60.0) + (seconds / 3600.0)
+    if ref in ('S', 'W'):
         dec = -dec
     return dec
 
@@ -555,29 +617,70 @@ def _gps_to_decimal(coord, ref):
 def extract_exif(path: str) -> dict:
     if not PIL_OK:
         raise RuntimeError("Pillow kurulu değil (pip install Pillow)")
-    img = Image.open(path)
-    raw = img.getexif()
-    result = {"tags": {}, "gps": None, "has_exif": False}
-    if not raw:
-        return result
-    result["has_exif"] = True
-    gps_raw = None
-    for tag_id, value in raw.items():
-        tag = ExifTags.TAGS.get(tag_id, str(tag_id))
-        if tag == "GPSInfo":
-            gps_raw = value
-        else:
-            result["tags"][tag] = value
+    try:
+        img = Image.open(path)
 
-    if gps_raw:
-        gps_named = {ExifTags.GPSTAGS.get(k, k): v for k, v in gps_raw.items()}
-        try:
-            lat = _gps_to_decimal(gps_named["GPSLatitude"], gps_named.get("GPSLatitudeRef", "N"))
-            lon = _gps_to_decimal(gps_named["GPSLongitude"], gps_named.get("GPSLongitudeRef", "E"))
-            result["gps"] = {"lat": lat, "lon": lon}
-        except Exception:
-            pass
-    return result
+        result = {"tags": {}, "gps": None, "has_exif": False}
+        
+        # --- Get all available metadata ---
+        all_tags = {}
+        # 1. From PNG-style info
+        if hasattr(img, 'info') and isinstance(img.info, dict):
+            all_tags.update(img.info)
+        
+        # 2. From EXIF
+        exif_data = img.getexif()
+        if exif_data:
+            for tag_id, value in exif_data.items():
+                tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
+                if tag_name == "GPSInfo": continue # Will be handled separately
+                
+                if isinstance(value, bytes):
+                    try:
+                        value = value.decode('utf-8', errors='replace').strip('\x00')
+                    except Exception:
+                        value = repr(value)
+                all_tags[tag_name] = value
+
+        if not all_tags and not exif_data:
+            return result
+            
+        result["has_exif"] = True
+        result["tags"] = all_tags
+
+        # --- GPS Specific, more robust parsing using the dedicated IFD method ---
+        if exif_data:
+            gps_ifd = exif_data.get_ifd(ExifTags.IFD.GPSInfo)
+            if gps_ifd:
+                gps_named = {ExifTags.GPSTAGS.get(k, k): v for k, v in gps_ifd.items()}
+
+                lat_coord = gps_named.get("GPSLatitude")
+                lon_coord = gps_named.get("GPSLongitude")
+
+                # The coordinates themselves are required.
+                if lat_coord and lon_coord:
+                    # The Ref tags might be omitted by some cameras, default to N/E.
+                    lat_ref_raw = gps_named.get("GPSLatitudeRef", "N")
+                    lon_ref_raw = gps_named.get("GPSLongitudeRef", "E")
+
+                    # Safely decode reference tags if they are bytes
+                    lat_ref = lat_ref_raw
+                    if isinstance(lat_ref, bytes):
+                        lat_ref = lat_ref.decode('ascii', errors='ignore').strip('\x00')
+
+                    lon_ref = lon_ref_raw
+                    if isinstance(lon_ref, bytes):
+                        lon_ref = lon_ref.decode('ascii', errors='ignore').strip('\x00')
+
+                    lat = _gps_to_decimal(lat_coord, lat_ref)
+                    lon = _gps_to_decimal(lon_coord, lon_ref)
+
+                    if lat is not None and lon is not None:
+                        result["gps"] = {"lat": lat, "lon": lon}
+
+        return result
+    except Exception as e:
+        raise RuntimeError(f"Görsel dosyası işlenemedi veya desteklenmiyor.\n\nDetay: {e}")
 
 
 def mac_vendor_lookup(mac: str) -> str:
@@ -765,15 +868,17 @@ def pastebin_scraper(keyword: str, progress_callback=None) -> list:
                 report(f"-> Hata: {pid} çekilemedi.")
     return results
 
+# Not: Bu tarayıcı sadece TCP portlarını tarar. UDP taraması (örn. Minecraft Bedrock) şu anki haliyle desteklenmemektedir.
 COMMON_PORTS = {
-    21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP",
+    21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS (TCP)", 80: "HTTP",
     110: "POP3", 143: "IMAP", 443: "HTTPS", 3306: "MySQL", 3389: "RDP",
     5432: "PostgreSQL", 6379: "Redis", 8080: "HTTP-Alt", 8443: "HTTPS-Alt",
-    25565: "Minecraft (Java)", 19132: "Minecraft (Bedrock/UDP)", 27015: "Source Engine",
+    25565: "Minecraft (Java)",
+    27015: "Source Engine (RCON)", # Genellikle UDP, ama RCON için TCP kullanabilir
 }
 
 
-def scan_common_ports(host: str, timeout=1.2) -> dict:
+def scan_common_ports(host: str, timeout=2.0) -> dict:
     host = host.strip()
     try:
         ip = socket.gethostbyname(host)
@@ -1013,11 +1118,29 @@ TR_BANK_CODES = {
     "10020": "Param",
 }
 
+# Banka kodlarına göre bazı yaygın örnek BIN'ler. Bu liste tam değildir ve sadece görsel bir örnektir.
+TR_BANK_EXAMPLE_BINS = {
+    "00010": ["499884", "554961", "589004"], # Ziraat Bankası (Visa, Mastercard, Troy)
+    "00012": ["403059", "552879", "979208"], # Halkbank (Visa, Mastercard, Troy)
+    "00015": ["435528", "552098", "979203"], # Vakıfbank (Visa, Mastercard, Troy)
+    "00032": ["402458", "540061"],          # TEB (Visa, Mastercard)
+    "00046": ["450803", "557036", "979215"], # Akbank (Visa, Mastercard, Troy)
+    "00062": ["426308", "554901"],          # Garanti BBVA (Visa, Mastercard)
+    "00064": ["454360", "552609", "979201"], # İş Bankası (Visa, Mastercard, Troy)
+    "00067": ["450680", "552401", "979205"], # Yapı Kredi (Visa, Mastercard, Troy)
+    "00099": ["415463", "549800"],          # ING Bank (Visa, Mastercard)
+    "00111": ["434070", "552641"],          # QNB Finansbank (Visa, Mastercard)
+    "00125": ["520418", "479240"],          # Denizbank (Mastercard, Visa)
+    "00205": ["421880", "552083"],          # Kuveyt Türk (Visa, Mastercard)
+    "00206": ["409549", "552986"],          # Türkiye Finans (Visa, Mastercard)
+}
+
 def analyze_iban(iban: str) -> dict:
     iban = iban.strip().replace(" ", "").upper()
     result = {
         "iban": iban, "is_valid": False, "country_code": None, "bank_code": None,
-        "bank_name": "Bilinmiyor", "branch_code": None, "account_number": None, "error": None
+        "bank_name": "Bilinmiyor", "branch_code": None, "account_number": None, "error": None,
+        "example_bins": []
     }
 
     if not re.fullmatch(r"[A-Z]{2}[0-9]{2}[A-Z0-9]{1,30}", iban):
@@ -1045,44 +1168,146 @@ def analyze_iban(iban: str) -> dict:
         result["branch_code"] = iban[10:14]
         result["account_number"] = iban[10:]
         result["bank_name"] = TR_BANK_CODES.get(result["bank_code"], "Banka kodu tanınamadı")
+        if result["bank_code"] in TR_BANK_EXAMPLE_BINS:
+            result["example_bins"] = TR_BANK_EXAMPLE_BINS[result["bank_code"]]
     else:
         result["bank_name"] = "Sadece Türkiye IBAN'ları için banka bilgisi gösterilir."
 
     return result
 
+def bin_lookup(bin_number: str) -> dict:
+    if not REQUESTS_OK:
+        raise RuntimeError("requests kütüphanesi kurulu değil")
+
+    # Clean and validate BIN
+    bin_clean = re.sub(r"[^0-9]", "", bin_number.strip())
+    if not (6 <= len(bin_clean) <= 8):
+        raise ValueError("Geçersiz BIN. Lütfen kartın ilk 6-8 hanesini girin.")
+
+    try:
+        r = requests.get(f"https://lookup.binlist.net/{bin_clean}", headers=UA, timeout=10)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"API bağlantı hatası: {e}")
+
+    if r.status_code == 404:
+        raise RuntimeError("BIN bulunamadı veya geçersiz.")
+    if r.status_code == 429:
+        raise RuntimeError("API rate limit'e ulaşıldı. Lütfen bir süre sonra tekrar deneyin.")
+
+    r.raise_for_status()
+
+    try:
+        data = r.json()
+    except json.JSONDecodeError:
+        raise RuntimeError("API'den geçersiz yanıt alındı (JSON parse edilemedi).")
+
+    country = data.get("country", {}) or {}
+    bank = data.get("bank", {}) or {}
+
+    return {
+        "bin": bin_clean,
+        "scheme": data.get("scheme", "-").capitalize(),
+        "type": data.get("type", "-").capitalize(),
+        "brand": data.get("brand", "-"),
+        "country_name": f"{country.get('name', '-')} ({country.get('alpha2', '-')})",
+        "bank_name": bank.get("name", "-"),
+        "bank_url": bank.get("url", "-"),
+        "bank_phone": bank.get("phone", "-"),
+        "prepaid": data.get("prepaid", False),
+    }
+
 # ================= GUI =================
+
+class SplashScreen(tk.Toplevel):
+    def __init__(self, parent):
+        tk.Toplevel.__init__(self, parent)
+        self.overrideredirect(True)
+
+        theme = parent.theme
+
+        main_frame = tk.Frame(self, bg=theme["BORDER"])
+        main_frame.pack(padx=1, pady=1)
+
+        content_frame = tk.Frame(main_frame, bg=theme["PANEL"], padx=60, pady=40)
+        content_frame.pack()
+
+        # Try to load and display the icon
+        try:
+            # Assuming ICON_BASE64 is defined globally, which the main app does
+            icon_data = base64.b64decode(ICON_BASE64)
+            self.icon = tk.PhotoImage(data=icon_data)
+            tk.Label(content_frame, image=self.icon, bg=theme["PANEL"]).pack(pady=(0, 20))
+        except (NameError, tk.TclError, Exception):
+            # If ICON_BASE64 is not defined or image fails to load, just skip it
+            pass
+
+        header = tk.Frame(content_frame, bg=theme["PANEL"])
+        header.pack()
+        tk.Label(header, text="GHOST", font=FONT_TITLE, bg=theme["PANEL"], fg=theme["RED"]).pack(side="left")
+        tk.Label(header, text=" OSINT FRAMEWORK", font=FONT_TITLE, bg=theme["PANEL"], fg=theme["FG"]).pack(side="left")
+
+        tk.Label(content_frame, text="Yükleniyor...", font=FONT, bg=theme["PANEL"], fg=theme["FG_DIM"]).pack(pady=(25, 0))
+
+        self.update_idletasks()
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        splash_w = self.winfo_width()
+        splash_h = self.winfo_height()
+        x = (screen_w // 2) - (splash_w // 2)
+        y = (screen_h // 2) - (splash_h // 2)
+        self.geometry(f"{splash_w}x{splash_h}+{x}+{y}")
+
+        self.lift()
+        self.update()
 
 class GhostOSINT(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.withdraw() # Ana pencereyi başlangıçta gizle
+
+        # Splash screen'in teması için temel ayarları önden yükle
+        self.app_config = load_config()
+        self.current_theme_name = "Ghost Dark"
+        self.theme = THEMES[self.current_theme_name].copy()
+
+        # Açılış ekranını göster
+        splash = SplashScreen(self)
+
+        # --- Tam Başlatma ---
         self.title(f"GHOST OSINT FRAMEWORK {CURRENT_VERSION} (Alpha) — by TarikPro43391")
 
-        self.current_theme_name = "Ghost Dark"
-        self.theme = THEMES[self.current_theme_name]
         self.tracked_widgets = []
         self.nb = None
         self.report_is_dirty = False
+        self.tab_results = {}
+        self.tab_defs = []
 
         try:
-            icon_data = base64.b64decode(ICON_BASE64)
+            # ICON_BASE64 global olarak tanımlı olmalı
+            icon_data = base64.b64decode(ICON_BASE64) 
             self.icon = tk.PhotoImage(data=icon_data)
             self.iconphoto(True, self.icon)
         except Exception:
             pass # İkon yüklenemezse sorun değil, varsayılan ikon kullanılır.
 
         self.geometry("1020x720")
-        self.configure(bg=self.theme["BG"])
         self.minsize(920, 600)
 
         self._build_menu()
         self.output_widgets = {}
 
+        self.configure(bg=self.theme["BG"])
         self._build_style()
         self._build_header()
         self._build_tabs()
         self._build_statusbar()
         self._check_for_updates()
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # Başlatma tamamlandı, splash'i kapat ve ana pencereyi göster
+        self.update_idletasks()
+        splash.destroy()
+        self._start_fade_in()
 
     # ---------- MENU ----------
     def _build_menu(self):
@@ -1092,15 +1317,18 @@ class GhostOSINT(tk.Tk):
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Ayarlar", menu=settings_menu)
 
-        theme_menu = tk.Menu(settings_menu, tearoff=0)
-        settings_menu.add_cascade(label="Tema", menu=theme_menu)
+        self.theme_menu = tk.Menu(settings_menu, tearoff=0)
+        settings_menu.add_cascade(label="Tema", menu=self.theme_menu)
 
         for theme_name in THEMES:
-            theme_menu.add_command(
+            self.theme_menu.add_command(
                 label=theme_name,
                 command=lambda t=theme_name: self._apply_theme(t)
             )
         
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Tema Editörü...", command=self._show_theme_editor_window)
+        settings_menu.add_command(label="Sekme Yöneticisi...", command=self._show_tab_manager_window)
         settings_menu.add_separator()
         settings_menu.add_command(label="Hakkında", command=self._show_about_window)
         settings_menu.add_command(label="GitHub'da Görüntüle", command=lambda: webbrowser.open("https://github.com/TarikPro43391/GHOST-OSINT-FRAMEWORK"))
@@ -1127,6 +1355,13 @@ class GhostOSINT(tk.Tk):
         style.configure("TEntry", fieldbackground=self.theme["PANEL2"], foreground=self.theme["FG"],
                         insertcolor=self.theme["FG"], borderwidth=1, relief="flat", bordercolor=self.theme["BORDER"])
         style.map("TEntry", bordercolor=[("focus", self.theme["BLUE"])])
+
+        style.configure("TCheckbutton",
+                        background=self.theme["PANEL"],
+                        foreground=self.theme["FG"],
+                        indicatorcolor=self.theme["BORDER"],
+                        font=FONT)
+        style.map("TCheckbutton", background=[("active", self.theme["PANEL2"])])
 
         style.configure("Clear.TButton", background=self.theme["PANEL2"], foreground=self.theme["FG_DIM"],
                         font=("Segoe UI", 8), borderwidth=1, relief="flat", padding=(5, 2), bordercolor=self.theme["BORDER"])
@@ -1183,45 +1418,21 @@ class GhostOSINT(tk.Tk):
         self.nb = nb
         nb.pack(fill="both", expand=True, padx=16, pady=8)
 
-        tab_defs = [
-            ("discord", "DISCORD ID"), ("ip", "IP LOOKUP"), ("domain", "DOMAIN/DNS"),
-            ("username", "USERNAME"), ("email", "EMAIL"), ("hash", "HASH"),
-            ("phone", "PHONE"), ("url", "URL/QR"), ("exif", "EXIF"),
-            ("mac", "MAC VENDOR"), ("ua", "USER-AGENT"), ("subdomain", "SUBDOMAIN"),
-            ("wayback", "WAYBACK"), ("breach", "BREACH"), ("portscan", "PORT SCAN"),
-            ("leak", "LEAK SEARCH"), ("pastebin", "PASTEBIN"),
-            ("invite", "INVITE"), ("ssl", "SSL"),
-            ("iban", "IBAN"), ("xss", "XSS"), ("sql", "SQLi")
-        ]
+        # Filter tab definitions based on config
+        visible_tab_names = self.app_config.get("visible_tabs", [name for name, _ in ALL_TAB_DEFS])
+        self.tab_defs = [t for t in ALL_TAB_DEFS if t[0] in visible_tab_names]
 
-        for name, text in tab_defs:
+        for name, text in self.tab_defs:
             tab_frame = tk.Frame(nb, bg=self.theme["BG"])
             self.tracked_widgets.append((tab_frame, {"bg": "BG"}))
             setattr(self, f"tab_{name}", tab_frame)
             nb.add(tab_frame, text=text)
 
-        self._build_discord_tab()
-        self._build_ip_tab()
-        self._build_domain_tab()
-        self._build_username_tab()
-        self._build_email_tab()
-        self._build_hash_tab()
-        self._build_phone_tab()
-        self._build_url_tab()
-        self._build_exif_tab()
-        self._build_mac_tab()
-        self._build_ua_tab()
-        self._build_subdomain_tab()
-        self._build_wayback_tab()
-        self._build_breach_tab()
-        self._build_portscan_tab()
-        self._build_leak_tab()
-        self._build_pastebin_tab()
-        self._build_invite_tab()
-        self._build_ssl_tab()
-        self._build_iban_tab()
-        self._build_xss_tab()
-        self._build_sql_tab()
+        # Call build methods only for visible tabs
+        for name, _ in self.tab_defs:
+            build_method = getattr(self, f"_build_{name}_tab", None)
+            if build_method:
+                build_method()
 
     # ---------- ORTAK YARDIMCI WIDGET ----------
     def _labeled_entry(self, parent, label, width=40, show=None):
@@ -1323,13 +1534,23 @@ class GhostOSINT(tk.Tk):
 
         self._run_async(check_for_updates, on_done)
 
-    def _apply_theme(self, theme_name):
-        if theme_name not in THEMES or theme_name == self.current_theme_name:
+    def _start_fade_in(self):
+        """Starts the main window fade-in animation."""
+        self.attributes('-alpha', 0.0)
+        self.deiconify()
+        self.alpha = 0.0
+        self._fade_in_step()
+
+    def _fade_in_step(self):
+        self.alpha += 0.05
+        if self.alpha >= 1.0:
+            self.attributes('-alpha', 1.0)
             return
+        self.attributes('-alpha', self.alpha)
+        self.after(25, self._fade_in_step)
 
-        self.current_theme_name = theme_name
-        self.theme = THEMES[theme_name]
-
+    def _update_ui_from_theme(self):
+        """Applies the colors from the current self.theme dict to all tracked widgets."""
         # 1. Update main window
         self.configure(bg=self.theme["BG"])
 
@@ -1349,55 +1570,210 @@ class GhostOSINT(tk.Tk):
                 # Widget might have been destroyed
                 pass
 
+    def _apply_theme(self, theme_name):
+        if theme_name not in THEMES or theme_name == self.current_theme_name:
+            return
+        self.current_theme_name = theme_name
+        self.theme = THEMES[theme_name].copy()
+        self._update_ui_from_theme()
         self.set_status(f"Tema '{theme_name}' olarak değiştirildi.")
 
     def _export_report(self):
+        if not self.report_is_dirty:
+            messagebox.showinfo("Bilgi", "Rapor oluşturulacak herhangi bir çıktı bulunamadı.")
+            return
+
+        try:
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[
+                    ("Metin Dosyası", "*.txt"),
+                    ("JSON Dosyası", "*.json"),
+                    ("CSV Dosyası", "*.csv"),
+                    ("HTML Dosyası", "*.html"),
+                    ("Tüm Dosyalar", "*.*")
+                ],
+                title="Raporu Kaydet",
+                initialfile=f"ghost_osint_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            if not file_path:
+                return
+
+            _, extension = os.path.splitext(file_path)
+            if extension.lower() == ".json":
+                self._export_as_json(file_path)
+            elif extension.lower() == ".csv":
+                self._export_as_csv(file_path)
+            elif extension.lower() == ".html":
+                self._export_as_html(file_path)
+            else: # Default to TXT
+                self._export_as_txt(file_path)
+
+            self.set_status(f"Rapor başarıyla kaydedildi.")
+            messagebox.showinfo("Başarılı", f"Rapor başarıyla kaydedildi:\n{file_path}")
+            self.report_is_dirty = False
+        except Exception as e:
+            messagebox.showerror("Hata", f"Rapor kaydedilirken bir hata oluştu:\n{e}")
+
+    def _export_as_txt(self, file_path):
         report_lines = []
         report_lines.append("================================================")
         report_lines.append(" GHOST OSINT FRAMEWORK - Toplu Rapor")
         report_lines.append(f" Rapor Tarihi: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         report_lines.append("================================================\n")
 
-        has_content = False
-        # Raporun daha düzenli olması için sekmelerin sırasına göre çıktıları al
-        tab_order = [
-            "DISCORD ID", "IP LOOKUP", "DOMAIN / DNS", "USERNAME", "EMAIL", "HASH", "PHONE",
-            "URL / QR", "EXIF", "MAC VENDOR", "USER-AGENT", "SUBDOMAIN", "WAYBACK",
-            "BREACH CHECK", "PORT SCAN", "LEAK SEARCH", "PASTEBIN SCRAPER", "DISCORD INVITE", "SSL SERTİFİKA",
-            "IBAN ANALYZER", "XSS TEST", "SQLi TEST"
-        ]
+        tab_order = [text for name, text in self.tab_defs]
         for tab_name in tab_order:
             if tab_name in self.output_widgets:
                 widget = self.output_widgets[tab_name]
                 content = widget.get("1.0", "end-1c").strip()
                 if content:
-                    has_content = True
                     report_lines.append(f"########## {tab_name.upper()} ##########\n")
                     report_lines.append(content)
                     report_lines.append("\n\n")
 
-        if not has_content:
-            messagebox.showinfo("Bilgi", "Rapor oluşturulacak herhangi bir çıktı bulunamadı.")
-            return
-
         report_content = "".join(report_lines)
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(report_content)
 
+    def _export_as_json(self, file_path):
+        report_data = {
+            "report_metadata": {
+                "tool": f"GHOST OSINT FRAMEWORK {CURRENT_VERSION}",
+                "generated_at_utc": datetime.now(timezone.utc).isoformat()
+            },
+            "results": self.tab_results
+        }
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(report_data, f, indent=4, ensure_ascii=False)
+
+    def _export_as_csv(self, file_path):
+        rows = []
+        header = ['Modül', 'Girdi', 'Kategori', 'Anahtar', 'Değer']
+        rows.append(header)
+
+        for module_name, data in sorted(self.tab_results.items()):
+            input_val = str(data.get("input", ""))
+            
+            for category, result_data in data.items():
+                if category == "input":
+                    continue
+
+                # Case 1: Result is a dictionary (e.g., IP Lookup, SSL Cert)
+                if isinstance(result_data, dict):
+                    for key, value in result_data.items():
+                        if not isinstance(value, (list, dict)):
+                            rows.append([module_name, input_val, category, key, str(value)])
+
+                # Case 2: Result is a list
+                elif isinstance(result_data, list):
+                    for item in result_data:
+                        if isinstance(item, dict):
+                            sub_category_key = item.get("platform") or item.get("id") or category
+                            for key, value in item.items():
+                                rows.append([module_name, input_val, sub_category_key, key, str(value)])
+                        else:
+                            rows.append([module_name, input_val, category, "item", str(item)])
+                
+                # Case 3: Result is a simple value (e.g., WHOIS result)
+                else:
+                    rows.append([module_name, input_val, category, "result", str(result_data)])
+        
         try:
-            file_path = filedialog.asksaveasfilename(
-                defaultextension=".txt",
-                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
-                title="Raporu Kaydet",
-                initialfile=f"ghost_osint_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            )
-            if not file_path:
-                return
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(report_content)
-            self.set_status(f"Rapor başarıyla kaydedildi.")
-            messagebox.showinfo("Başarılı", f"Rapor başarıyla kaydedildi:\n{file_path}")
-            self.report_is_dirty = False
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerows(rows)
         except Exception as e:
-            messagebox.showerror("Hata", f"Rapor kaydedilirken bir hata oluştu:\n{e}")
+            raise IOError(f"CSV dosyası yazılırken hata oluştu: {e}")
+
+    def _export_as_html(self, file_path):
+        import html as html_escaper
+        theme = self.theme
+
+        def linkify(text):
+            text = html_escaper.escape(str(text))
+            url_pattern = re.compile(r'(https?://[^\s"\'<>]+)')
+            return url_pattern.sub(r'<a href="\1" target="_blank">\1</a>', text)
+
+        def build_kv_table(data_dict):
+            if not isinstance(data_dict, dict):
+                return f"<pre>{linkify(data_dict)}</pre>"
+            table_html = "<table class='kv-table'>"
+            for key, value in data_dict.items():
+                if isinstance(value, (list, dict)):
+                    value_str = json.dumps(value, indent=2, ensure_ascii=False)
+                    value_str = f"<pre>{linkify(value_str)}</pre>"
+                else:
+                    value_str = linkify(value)
+                table_html += f"<tr><th>{html_escaper.escape(str(key).replace('_', ' ').title())}</th><td>{value_str}</td></tr>"
+            table_html += "</table>"
+            return table_html
+
+        def build_list_table(data_list):
+            if not data_list:
+                return "<p>Sonuç bulunamadı.</p>"
+            if not isinstance(data_list[0], dict):
+                items = "".join(f"<li>{linkify(item)}</li>" for item in data_list)
+                return f"<ul>{items}</ul>"
+
+            headers = list(data_list[0].keys())
+            table_html = "<table><thead><tr>"
+            for header in headers:
+                table_html += f"<th>{html_escaper.escape(str(header).replace('_', ' ').title())}</th>"
+            table_html += "</tr></thead><tbody>"
+            for row_dict in data_list:
+                table_html += "<tr>"
+                for header in headers:
+                    value = row_dict.get(header, "-")
+                    table_html += f"<td>{linkify(value)}</td>"
+                table_html += "</tr>"
+            table_html += "</tbody></table>"
+            return table_html
+
+        html_content = f"""
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <title>GHOST OSINT Raporu</title>
+    <style>
+        body {{ font-family: "Segoe UI", sans-serif; background-color: {theme['BG']}; color: {theme['FG']}; line-height: 1.6; margin: 0; padding: 20px; }}
+        .container {{ max-width: 1200px; margin: 0 auto; padding: 20px; background-color: {theme['PANEL']}; border: 1px solid {theme['BORDER']}; border-radius: 8px; }}
+        h1, h2 {{ color: {theme['RED']}; border-bottom: 2px solid {theme['BORDER']}; padding-bottom: 10px; }}
+        h1 {{ font-size: 2em; }}
+        h2 {{ font-size: 1.5em; margin-top: 40px; }}
+        h3 {{ font-size: 1.2em; color: {theme['FG_DIM']}; margin-top: 25px; border-bottom: 1px solid {theme['BORDER']}; padding-bottom: 5px;}}
+        .module-section {{ padding: 20px; margin-bottom: 20px; background-color: {theme['PANEL2']}; border-radius: 5px; overflow-x: auto; }}
+        .input-val {{ font-family: "Consolas", monospace; color: {theme['FG_DIM']}; background-color: {theme['BG']}; padding: 2px 6px; border-radius: 3px; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
+        th, td {{ padding: 12px 15px; border: 1px solid {theme['BORDER']}; text-align: left; word-break: break-word; }}
+        th {{ background-color: {theme['BG']}; font-weight: bold; }}
+        table.kv-table th {{ font-weight: bold; color: {theme['FG_DIM']}; width: 25%; }}
+        pre {{ background-color: {theme['BG']}; color: {theme['FG']}; padding: 15px; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; }}
+        a {{ color: {theme['BLUE']}; text-decoration: none; }}
+        a:hover {{ text-decoration: underline; }}
+        .meta {{ font-size: 0.9em; color: {theme['FG_DIM']}; margin-bottom: 30px; }}
+    </style>
+</head>
+<body><div class="container">
+<h1>GHOST OSINT FRAMEWORK Raporu</h1>
+<p class="meta">Oluşturulma Tarihi: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+"""
+        for module_name, data in sorted(self.tab_results.items()):
+            input_val = data.get("input", "")
+            html_content += f"<h2>{html_escaper.escape(module_name)}</h2><div class='module-section'>"
+            if input_val:
+                html_content += f"<p><strong>Girdi:</strong> <span class='input-val'>{html_escaper.escape(str(input_val))}</span></p>"
+            for category, result_data in data.items():
+                if category == "input": continue
+                html_content += f"<h3>{html_escaper.escape(category.replace('_', ' ').title())}</h3>"
+                if isinstance(result_data, dict): html_content += build_kv_table(result_data)
+                elif isinstance(result_data, list): html_content += build_list_table(result_data)
+                else: html_content += f"<pre>{linkify(result_data)}</pre>"
+            html_content += "</div>"
+        html_content += "</div></body></html>"
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
 
     def _clear_all_outputs(self):
         if not self.report_is_dirty:
@@ -1409,6 +1785,7 @@ class GhostOSINT(tk.Tk):
                 box.configure(state="normal")
                 box.delete("1.0", "end")
                 box.configure(state="disabled")
+            self.tab_results.clear()
             self.report_is_dirty = False
             self.set_status("Tüm çıktılar başarıyla temizlendi.")
 
@@ -1451,6 +1828,198 @@ class GhostOSINT(tk.Tk):
         about_win.grab_set()
         self.wait_window(about_win)
 
+    # ================= THEME EDITOR =================
+    def _save_custom_theme(self):
+        try:
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".json",
+                filetypes=[("JSON Theme Files", "*.json"), ("All files", "*.*")],
+                title="Özel Temayı Kaydet",
+                initialfile=f"{self.current_theme_name.replace(' ', '_')}_custom.json"
+            )
+            if not file_path:
+                return
+
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(self.theme, f, indent=4)
+
+            self.set_status(f"Tema başarıyla '{os.path.basename(file_path)}' dosyasına kaydedildi.")
+            messagebox.showinfo("Başarılı", "Tema başarıyla kaydedildi.")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Tema kaydedilirken bir hata oluştu:\n{e}")
+
+    def _load_custom_theme(self, parent_window=None):
+        try:
+            file_path = filedialog.askopenfilename(
+                defaultextension=".json",
+                filetypes=[("JSON Theme Files", "*.json"), ("All files", "*.*")],
+                title="Özel Tema Yükle"
+            )
+            if not file_path:
+                return
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                loaded_theme = json.load(f)
+
+            # Validation
+            if not isinstance(loaded_theme, dict):
+                raise ValueError("Tema dosyası geçerli bir JSON nesnesi (sözlük) içermiyor.")
+            required_keys = set(THEMES["Ghost Dark"].keys())
+            if not required_keys.issubset(loaded_theme.keys()):
+                missing_keys = required_keys - set(loaded_theme.keys())
+                raise ValueError(f"Tema dosyasında eksik anahtarlar var: {', '.join(missing_keys)}")
+
+            # Add and Apply Theme
+            theme_name = os.path.splitext(os.path.basename(file_path))[0]
+            theme_name = theme_name.replace("_", " ").replace("-", " ").title()
+
+            if theme_name not in THEMES:
+                THEMES[theme_name] = loaded_theme
+                self.theme_menu.add_command(
+                    label=theme_name,
+                    command=lambda t=theme_name: self._apply_theme(t)
+                )
+            else: # Update existing theme if name matches
+                THEMES[theme_name] = loaded_theme
+
+            self._apply_theme(theme_name)
+            self.set_status(f"Özel tema '{theme_name}' yüklendi ve uygulandı.")
+
+            if parent_window and parent_window.winfo_exists():
+                parent_window.destroy()
+                self._show_theme_editor_window()
+
+        except json.JSONDecodeError:
+            messagebox.showerror("Hata", "Tema dosyası geçerli bir JSON formatında değil.")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Tema yüklenirken bir hata oluştu:\n{e}")
+
+    def _get_contrasting_fg(self, hex_color):
+        """Calculates a contrasting foreground color (black or white) for a given background hex color."""
+        try:
+            if not hex_color.startswith('#') or len(hex_color) != 7:
+                return "#000000"
+            r = int(hex_color[1:3], 16)
+            g = int(hex_color[3:5], 16)
+            b = int(hex_color[5:7], 16)
+            # Formula for luminance (per W3C)
+            luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+            return "#000000" if luminance > 0.5 else "#FFFFFF"
+        except (ValueError, TypeError):
+            return "#000000"
+
+    def _show_theme_editor_window(self):
+        from tkinter import colorchooser
+
+        editor_win = tk.Toplevel(self)
+        editor_win.title("Tema Editörü")
+        editor_win.configure(bg=self.theme["PANEL"], padx=20, pady=15)
+        editor_win.resizable(False, False)
+
+        # Center window
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - (editor_win.winfo_reqwidth() // 2)
+        y = self.winfo_y() + (self.winfo_height() // 2) - (editor_win.winfo_reqheight() // 2)
+        editor_win.geometry(f"+{x}+{y}")
+
+        tk.Label(editor_win, text=f"Mevcut Tema: {self.current_theme_name}", font=FONT_B, bg=self.theme["PANEL"], fg=self.theme["FG"]).pack(pady=(0, 15))
+
+        color_labels = {}
+
+        def change_color(key):
+            current_color = self.theme[key]
+            new_color = colorchooser.askcolor(color=current_color, title=f"'{key}' için renk seç")
+
+            if new_color and new_color[1]:
+                hex_color = new_color[1]
+                self.theme[key] = hex_color
+                color_labels[key].config(text=hex_color, bg=hex_color, fg=self._get_contrasting_fg(hex_color))
+                self._update_ui_from_theme()
+                self.set_status(f"Tema rengi '{key}' güncellendi.")
+
+        grid_frame = tk.Frame(editor_win, bg=self.theme["PANEL"])
+        grid_frame.pack()
+
+        sorted_keys = sorted(self.theme.keys())
+        for i, key in enumerate(sorted_keys):
+            color = self.theme[key]
+            tk.Label(grid_frame, text=f"{key}:", font=FONT, bg=self.theme["PANEL"], fg=self.theme["FG_DIM"]).grid(row=i, column=0, sticky="w", padx=5, pady=3)
+            lbl = tk.Label(grid_frame, text=color, font=FONT_MONO, bg=color, fg=self._get_contrasting_fg(color), width=10, relief="groove", borderwidth=2)
+            lbl.grid(row=i, column=1, padx=5, pady=3)
+            color_labels[key] = lbl
+            btn = ttk.Button(grid_frame, text="Değiştir", command=lambda k=key: change_color(k), style="Blue.TButton")
+            btn.grid(row=i, column=2, padx=5, pady=3)
+
+        def reset_theme():
+            self.theme = THEMES[self.current_theme_name].copy()
+            self._update_ui_from_theme()
+            editor_win.destroy()
+            self._show_theme_editor_window()
+            self.set_status(f"Tema '{self.current_theme_name}' orijinal haline sıfırlandı.")
+
+        button_frame = tk.Frame(editor_win, bg=self.theme["PANEL"])
+        button_frame.pack(pady=(20, 0), fill="x")
+
+        ttk.Button(button_frame, text="Temayı Kaydet...", command=self._save_custom_theme).pack(side="left", expand=True, padx=2)
+        ttk.Button(button_frame, text="Tema Yükle...", command=lambda: self._load_custom_theme(editor_win), style="Blue.TButton").pack(side="left", expand=True, padx=2)
+        ttk.Button(button_frame, text="Temayı Sıfırla", command=reset_theme).pack(side="left", expand=True, padx=2)
+
+        editor_win.transient(self)
+        editor_win.grab_set()
+        self.wait_window(editor_win)
+
+    def _show_tab_manager_window(self):
+        manager_win = tk.Toplevel(self)
+        manager_win.title("Sekme Yöneticisi")
+        manager_win.configure(bg=self.theme["PANEL"], padx=20, pady=15)
+        manager_win.resizable(False, False)
+
+        # Center window
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - (manager_win.winfo_reqwidth() // 2)
+        y = self.winfo_y() + (self.winfo_height() // 2) - (manager_win.winfo_reqheight() // 2)
+        manager_win.geometry(f"+{x}+{y}")
+
+        tk.Label(manager_win, text="Görünecek Sekmeleri Seçin", font=FONT_B, bg=self.theme["PANEL"], fg=self.theme["FG"]).pack(pady=(0, 15))
+
+        tab_vars = {}
+        frame = tk.Frame(manager_win, bg=self.theme["PANEL"])
+        frame.pack()
+
+        # Create two columns of checkboxes
+        num_tabs = len(ALL_TAB_DEFS)
+        mid_point = (num_tabs + 1) // 2
+        
+        col1 = tk.Frame(frame, bg=self.theme["PANEL"])
+        col1.pack(side="left", padx=10, anchor="n")
+        col2 = tk.Frame(frame, bg=self.theme["PANEL"])
+        col2.pack(side="left", padx=10, anchor="n")
+
+        for i, (name, text) in enumerate(ALL_TAB_DEFS):
+            parent_col = col1 if i < mid_point else col2
+            var = tk.BooleanVar(value=(name in self.app_config["visible_tabs"]))
+            tab_vars[name] = var
+            chk = ttk.Checkbutton(parent_col, text=text, variable=var, style="TCheckbutton")
+            chk.pack(anchor="w", pady=2)
+
+        def save_and_close():
+            self.app_config["visible_tabs"] = [name for name, var in tab_vars.items() if var.get()]
+            save_config(self.app_config)
+            messagebox.showinfo(
+                "Kaydedildi", 
+                "Ayarlar kaydedildi.\n\nDeğişikliklerin etkili olması için lütfen uygulamayı yeniden başlatın.", 
+                parent=manager_win
+            )
+            manager_win.destroy()
+
+        button_frame = tk.Frame(manager_win, bg=self.theme["PANEL"])
+        button_frame.pack(pady=(20, 0), fill="x")
+        ttk.Button(button_frame, text="Kaydet ve Kapat", command=save_and_close, style="Blue.TButton").pack()
+
+        manager_win.transient(self)
+        manager_win.grab_set()
+        self.wait_window(manager_win)
+
     # ================= DISCORD TAB =================
     def _build_discord_tab(self):
         t = self.tab_discord
@@ -1485,6 +2054,7 @@ class GhostOSINT(tk.Tk):
                 f"Varsayılan Avatar: {info['default_avatar_url']}\n"
             )
             self._write(self.discord_output, out)
+            self.tab_results.setdefault("DISCORD ID", {"input": raw})["snowflake"] = info
             self.set_status("Snowflake decode tamamlandı.")
         except Exception as e:
             messagebox.showerror("Hata", str(e))
@@ -1520,6 +2090,7 @@ class GhostOSINT(tk.Tk):
                 f"Rozetler        : {', '.join(result['badges'])}\n"
             )
             self._write(self.discord_output, out)
+            self.tab_results.setdefault("DISCORD ID", {"input": raw_id})["profile"] = result
             self.set_status("Discord public profil alındı.")
 
         self._run_async(task, done)
@@ -1558,6 +2129,7 @@ class GhostOSINT(tk.Tk):
                 f"\nHarita: https://www.google.com/maps?q={result.get('lat')},{result.get('lon')}\n"
             )
             self._write(self.ip_output, out)
+            self.tab_results["IP LOOKUP"] = {"input": ip, "output": result}
             self.set_status("IP lookup tamamlandı.")
 
         self._run_async(lambda: ip_lookup(ip), done)
@@ -1590,6 +2162,7 @@ class GhostOSINT(tk.Tk):
             if result["raw_error"]:
                 out += f"\nHata: {result['raw_error']}\n"
             self._write(self.domain_output, out)
+            self.tab_results.setdefault("DOMAIN / DNS", {"input": domain})["dns"] = result
             self.set_status("DNS sorgu tamamlandı.")
 
         self._run_async(lambda: dns_lookup(domain), done)
@@ -1606,6 +2179,7 @@ class GhostOSINT(tk.Tk):
                 messagebox.showerror("Hata", str(err))
                 return
             self._write(self.domain_output, result)
+            self.tab_results.setdefault("DOMAIN / DNS", {"input": domain})["whois"] = result
             self.set_status("WHOIS sorgu tamamlandı.")
 
         self._run_async(lambda: whois_lookup(domain), done)
@@ -1648,6 +2222,8 @@ class GhostOSINT(tk.Tk):
                 mark = "✓" if status == "BULUNDU" else ("✗" if status == "YOK" else "?")
                 lines.append(f"[{mark}] {name:<12} {status:<10} {url}")
             self._write(self.username_output, "\n".join(lines))
+            results_as_dict = [{"platform": name, "status": status, "url": url} for name, status, url in results]
+            self.tab_results["USERNAME"] = {"input": username, "output": results_as_dict}
             self.set_status("Username arama tamamlandı.")
 
         self._run_async(task, done)
@@ -1680,6 +2256,7 @@ class GhostOSINT(tk.Tk):
                 f"MX Kayıtları      :\n  {mx}\n"
             )
             self._write(self.email_output, out)
+            self.tab_results["EMAIL"] = {"input": email, "output": result}
             self.set_status("Email analiz tamamlandı.")
 
         self._run_async(lambda: analyze_email(email), done)
@@ -1699,6 +2276,7 @@ class GhostOSINT(tk.Tk):
         guesses = identify_hash(h)
         out = f"[HASH IDENTIFY]\nUzunluk: {len(h)} karakter\nOlası Tür(ler):\n  " + "\n  ".join(guesses)
         self._write(self.hash_output, out)
+        self.tab_results["HASH"] = {"input": h, "output": guesses}
         self.set_status("Hash analiz tamamlandı.")
 
     # ================= PHONE TAB =================
@@ -1733,6 +2311,7 @@ class GhostOSINT(tk.Tk):
                 f"konum/kişi bilgisi vermez.\n"
             )
             self._write(self.phone_output, out)
+            self.tab_results["PHONE"] = {"input": number, "output": result}
             self.set_status("Telefon sorgusu tamamlandı.")
         except Exception as e:
             messagebox.showerror("Hata", str(e))
@@ -1777,6 +2356,7 @@ class GhostOSINT(tk.Tk):
             if result.get("error"):
                 out += f"\nHata: {result['error']}\n"
             self._write(self.url_output, out)
+            self.tab_results.setdefault("URL / QR", {})["url_analysis"] = {"input": url, "output": result}
             self.set_status("URL analiz tamamlandı.")
 
         self._run_async(lambda: analyze_url(url), done)
@@ -1799,6 +2379,7 @@ class GhostOSINT(tk.Tk):
                 self.set_status("QR okuma başarısız.")
                 return
             self._write(self.url_output, f"[QR KOD SONUCU]\nDosya: {path}\n\nİçerik:\n{result}\n")
+            self.tab_results.setdefault("URL / QR", {})["qr_decode"] = {"input": path, "output": result}
             self.set_status("QR kod okundu.")
 
         self._run_async(lambda: decode_qr(path), done)
@@ -1824,10 +2405,12 @@ class GhostOSINT(tk.Tk):
         self.set_status("EXIF/metadata çıkarılıyor...")
 
         def done(result, err):
-            if err:
-                messagebox.showerror("Hata", str(err))
+            if err or result is None:
+                error_message = str(err) if err else "Görsel işlenirken bilinmeyen bir hata oluştu (sonuç alınamadı)."
+                messagebox.showerror("Hata", error_message)
                 self.set_status("Metadata çıkarma başarısız.")
                 return
+
             if not result["has_exif"]:
                 self._write(self.exif_output, f"[EXIF]\nDosya: {path}\n\nBu dosyada EXIF metadata bulunamadı.\n")
                 self.set_status("EXIF bulunamadı.")
@@ -1845,6 +2428,7 @@ class GhostOSINT(tk.Tk):
             else:
                 lines.append("\nGPS verisi bulunamadı.")
             self._write(self.exif_output, "\n".join(lines))
+            self.tab_results["EXIF"] = {"input": path, "output": result}
             self.set_status("EXIF/metadata çıkarıldı.")
 
         self._run_async(lambda: extract_exif(path), done)
@@ -1869,6 +2453,7 @@ class GhostOSINT(tk.Tk):
                 self.set_status("Sorgu başarısız.")
                 return
             self._write(self.mac_output, f"[MAC VENDOR LOOKUP]\nMAC     : {mac}\nÜretici : {result}\n")
+            self.tab_results["MAC VENDOR"] = {"input": mac, "output": result}
             self.set_status("MAC vendor sorgusu tamamlandı.")
 
         self._run_async(lambda: mac_vendor_lookup(mac), done)
@@ -1894,6 +2479,7 @@ class GhostOSINT(tk.Tk):
             f"Bot mu?         : {'EVET - dikkat' if result['is_bot'] else 'Hayır'}\n"
         )
         self._write(self.ua_output, out)
+        self.tab_results["USER-AGENT"] = {"input": ua, "output": result}
         self.set_status("User-Agent parse edildi.")
 
 
@@ -1924,6 +2510,7 @@ class GhostOSINT(tk.Tk):
                 out = f"[SUBDOMAIN: {domain}] — {len(result)} sonuç\n\n" + "\n".join(result)
                 self._write(self.subdomain_output, out)
             self.set_status("Subdomain arama tamamlandı.")
+            self.tab_results["SUBDOMAIN"] = {"input": domain, "output": result}
 
         self._run_async(lambda: find_subdomains(domain), done)
 
@@ -1955,6 +2542,7 @@ class GhostOSINT(tk.Tk):
             if result.get("latest_snapshot_url"):
                 out += f"Son Snapshot Linki  : {result['latest_snapshot_url']}\n"
             self._write(self.wayback_output, out)
+            self.tab_results["WAYBACK"] = {"input": domain, "output": result}
             self.set_status("Wayback sorgusu tamamlandı.")
 
         self._run_async(lambda: wayback_history(domain), done)
@@ -1988,6 +2576,7 @@ class GhostOSINT(tk.Tk):
                        f"İhlaller:\n  - {breaches}\n\n"
                        f"Önerilen: Bu email ile kullandığın şifreleri değiştir ve 2FA aktif et.")
             self._write(self.breach_output, out)
+            self.tab_results["BREACH CHECK"] = {"input": email, "output": result}
             self.set_status("Breach check tamamlandı.")
 
         self._run_async(lambda: breach_check(email), done)
@@ -2022,6 +2611,7 @@ class GhostOSINT(tk.Tk):
                     lines.append(f"  {port:<6} AÇIK   ({name})")
                 out = "\n".join(lines)
             self._write(self.portscan_output, out)
+            self.tab_results["PORT SCAN"] = {"input": host, "output": result}
             self.set_status("Port tarama tamamlandı.")
 
         self._run_async(lambda: scan_common_ports(host), done)
@@ -2057,6 +2647,7 @@ class GhostOSINT(tk.Tk):
             f"o sekme bilinen ihlal veritabanını otomatik kontrol eder."
         )
         self._write(self.leak_output, out)
+        self.tab_results["LEAK SEARCH"] = {"input": term, "output": links}
         self.set_status("Leak search linkleri oluşturuldu.")
 
 
@@ -2096,6 +2687,7 @@ class GhostOSINT(tk.Tk):
                         for paste in results:
                             lines = [f"--- Paste ID: {paste['id']} ---", f"URL: {paste['url']}", "--- İÇERİK (ilk 20 satır) ---", *paste['content'].splitlines()[:20], "----------------------------------\n"]
                             progress_callback("\n".join(lines))
+                    self.tab_results["PASTEBIN SCRAPER"] = {"input": keyword, "output": results}
                     self.set_status("Pastebin taraması tamamlandı.")
                 self.after(0, final_update)
             except Exception as e:
@@ -2139,6 +2731,7 @@ class GhostOSINT(tk.Tk):
                 f"Sunucu İkonu      : {result['icon_url'] or '-'}\n"
             )
             self._write(self.invite_output, out)
+            self.tab_results["DISCORD INVITE"] = {"input": code, "output": result}
             self.set_status("Invite bilgisi alındı.")
 
         self._run_async(lambda: fetch_discord_invite(code), done)
@@ -2181,6 +2774,7 @@ class GhostOSINT(tk.Tk):
             if result["days_left"] < 15 and not result["expired"]:
                 out += "\n⚠ UYARI: Sertifikanın süresi 15 günden az bir zamanda dolacak!\n"
             self._write(self.ssl_output, out)
+            self.tab_results["SSL SERTİFİKA"] = {"input": domain, "output": result}
             self.set_status("SSL sertifika analizi tamamlandı.")
 
         self._run_async(lambda: check_ssl_certificate(domain), done)
@@ -2222,10 +2816,59 @@ class GhostOSINT(tk.Tk):
                     f"Şube Kodu (Tahmin): {result.get('branch_code') or '-'}\n"
                     f"Hesap Numarası    : {result.get('account_number') or '-'}\n"
                 )
+                if result.get("example_bins"):
+                    bins_str = ", ".join(result["example_bins"])
+                    out += (
+                        f"\nBu Bankaya Ait Örnek Kart BIN'leri:\n"
+                        f"  {bins_str}\n"
+                        f"(Bu BIN'leri 'BIN LOOKUP' sekmesinde sorgulatabilirsiniz.)\n"
+                    )
             self._write(self.iban_output, out)
+            self.tab_results["IBAN ANALYZER"] = {"input": iban, "output": result}
             self.set_status("IBAN analizi tamamlandı.")
 
         self._run_async(lambda: analyze_iban(iban), done)
+
+    # ================= BIN LOOKUP TAB =================
+    def _build_bin_tab(self):
+        t = self.tab_bin
+        self.bin_entry = self._labeled_entry(t, "BIN Numarası (ilk 6-8 hane):")
+        ttk.Button(t, text="BIN SORGULA", command=self._on_bin_lookup).pack(anchor="w", pady=6)
+        l = tk.Label(t, text="Kredi/Banka kartının ilk 6-8 hanesini girerek kart şeması, banka ve ülke bilgilerini sorgular.",
+                     bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9), justify="left")
+        l.pack(anchor="w")
+        self.tracked_widgets.append((l, {"bg": "BG", "fg": "FG_DIM"}))
+        self.bin_output = self._output_box(t, tab_name="BIN LOOKUP")
+
+    def _on_bin_lookup(self):
+        bin_num = self.bin_entry.get().strip()
+        if not bin_num:
+            messagebox.showerror("Hata", "Lütfen bir BIN numarası girin.")
+            return
+        self.set_status("BIN bilgisi sorgulanıyor...")
+
+        def done(result, err):
+            if err:
+                messagebox.showerror("Hata", str(err))
+                self.set_status("BIN sorgusu başarısız.")
+                return
+
+            out = (
+                f"[BIN LOOKUP: {result['bin']}]\n"
+                f"Şema (Scheme) : {result['scheme']}\n"
+                f"Marka (Brand) : {result['brand']}\n"
+                f"Tip           : {result['type']}\n"
+                f"Ön Ödemeli mi?: {'Evet' if result['prepaid'] else 'Hayır'}\n"
+                f"Ülke          : {result['country_name']}\n"
+                f"Banka Adı     : {result['bank_name']}\n"
+                f"Banka URL     : {result['bank_url']}\n"
+                f"Banka Telefon : {result['bank_phone']}\n"
+            )
+            self._write(self.bin_output, out)
+            self.tab_results["BIN LOOKUP"] = {"input": bin_num, "output": result}
+            self.set_status("BIN sorgusu tamamlandı.")
+
+        self._run_async(lambda: bin_lookup(bin_num), done)
 
     # ================= XSS TEST TAB =================
     def _build_xss_tab(self):
@@ -2265,6 +2908,7 @@ class GhostOSINT(tk.Tk):
                             lines.append(f"  Parametre : {vuln['param']}\n  Payload   : {vuln['payload']}\n  URL       : {vuln['url']}\n" + "-"*20)
                         lines.append("\nNot: Bu test, payload'un sayfada değiştirilmeden yansıdığını kontrol eder. False-positive olabilir.")
                         progress_callback("\n".join(lines))
+                    self.tab_results["XSS TEST"] = {"input": url, "output": result}
                     self.set_status("XSS testi tamamlandı.")
                 self.after(0, final_update)
             except Exception as e:
@@ -2310,6 +2954,7 @@ class GhostOSINT(tk.Tk):
                         for vuln in result["details"]:
                             lines.append(f"  Parametre : {vuln['param']}\n  Payload   : {vuln['payload']}\n  Hata      : {vuln['error_snippet']}\n  URL       : {vuln['url']}\n" + "-"*20)
                         progress_callback("\n".join(lines))
+                    self.tab_results["SQLi TEST"] = {"input": url, "output": result}
                     self.set_status("SQLi testi tamamlandı.")
                 self.after(0, final_update)
             except Exception as e:
