@@ -1,10 +1,10 @@
 @echo off
-title Ghost OSINT Framework v0.1.2 - Baslatici
+title Ghost OSINT Framework v0.1.3 - Baslatici
 color 0A
 cd /d "%~dp0"
 
 echo ================================================================
-echo   GHOST OSINT FRAMEWORK v0.1.2 (Alpha) - Baslatici
+echo   GHOST OSINT FRAMEWORK v0.1.3 (Alpha) - Baslatici
 echo   by TarikPro43391
 echo ================================================================
 echo.
@@ -25,7 +25,11 @@ echo Eksik olanlar kurulacak. Lutfen bekleyin...
 echo.
 
 REM -q (sessiz mod) kaldirildi, boylece kullanici kurulumu ve olasi hatalari gorebilir.
-python -m pip install --disable-pip-version-check requests phonenumbers dnspython pillow opencv-python
+python -m pip install --disable-pip-version-check requests phonenumbers dnspython pillow opencv-python xhtml2pdf playwright
+
+echo.
+echo [OK] Playwright tarayicisi (Chromium) kuruluyor. Bu islem biraz surebilir...
+python -m playwright install --with-deps chromium
 
 echo.
 echo ================================================================

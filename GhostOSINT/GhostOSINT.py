@@ -1,7 +1,6 @@
 """
 ================================================================
- GHOST OSINT FRAMEWORK v0.1.1 (Alpha) - GUI EDITION
- GHOST OSINT FRAMEWORK v0.1.2 (Alpha) - GUI EDITION
+ GHOST OSINT FRAMEWORK v0.1.3 (Alpha) - GUI EDITION
  by TarikPro43391
 ================================================================
 Modüller:
@@ -72,6 +71,18 @@ try:
 except ImportError:
     CV2_OK = False
 
+try:
+    from xhtml2pdf import pisa
+    XHTML2PDF_OK = True
+except ImportError:
+    XHTML2PDF_OK = False
+
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_OK = True
+except ImportError:
+    PLAYWRIGHT_OK = False
+
 # ================= CONFIG & TABS =================
 CONFIG_FILE = "ghost_osint_config.json"
 
@@ -86,10 +97,14 @@ ALL_TAB_DEFS = [
     ("bin", "BIN LOOKUP"), ("xss", "XSS"), ("sql", "SQLi")
 ]
 
+ALL_TAB_DEFS.extend([("base64", "BASE64"), ("btc", "BITCOIN")])
+
 def get_default_config():
     """Returns the default application configuration."""
     return {
-        "visible_tabs": [name for name, text in ALL_TAB_DEFS]
+        "visible_tabs": [name for name, text in ALL_TAB_DEFS],
+        "shodan_api_key": "",
+        "hibp_api_key": ""
     }
 
 def load_config():
@@ -114,9 +129,9 @@ def save_config(config):
         messagebox.showerror("Hata", f"Ayarlar kaydedilemedi: {e}")
 
 # ================= VERSION =================
-CURRENT_VERSION = "v0.1.2"
+CURRENT_VERSION = "v0.1.3"
 # Gerçek bir repo URL'si ile değiştirin. version.json dosyası {"latest_version": "vX.Y.Z", "release_url": "..."} formatında olmalı.
-VERSION_CHECK_URL = "https://raw.githubusercontent.com/TarikPro43391/GHOST-OSINT-FRAMEWORK/main/version.json"
+VERSION_CHECK_URL = "https://raw.githubusercontent.com/TarikPro43391/GhostOSINT/main/version.json"
 
 
 # ================= THEMES =================
@@ -335,6 +350,47 @@ def ip_lookup(ip: str) -> dict:
         raise RuntimeError(data.get("message", "IP bulunamadı"))
     return data
 
+def shodan_lookup(ip: str, api_key: str) -> dict:
+    if not REQUESTS_OK:
+        raise RuntimeError("requests kütüphanesi kurulu değil")
+    if not api_key:
+        raise ValueError("Shodan API anahtarı gerekli.")
+
+    ip = ip.strip()
+    try:
+        r = requests.get(f"https://api.shodan.io/shodan/host/{ip}?key={api_key}", headers=UA, timeout=15)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Shodan API'ye bağlanılamadı: {e}")
+
+    if r.status_code == 401:
+        raise RuntimeError("Geçersiz Shodan API anahtarı (401).")
+    if r.status_code == 404:
+        raise RuntimeError("Shodan'da bu IP için bilgi bulunamadı (404).")
+    if r.status_code == 429:
+        raise RuntimeError("Shodan API rate limit aşıldı (429).")
+    
+    r.raise_for_status() # For other 4xx/5xx errors
+
+    try:
+        data = r.json()
+    except json.JSONDecodeError:
+        raise RuntimeError("Shodan API'den geçersiz JSON yanıtı alındı.")
+
+    # Extract relevant data
+    return {
+        "ip": data.get("ip_str"),
+        "organization": data.get("org", "-"),
+        "os": data.get("os", "-"),
+        "isp": data.get("isp", "-"),
+        "asn": data.get("asn", "-"),
+        "hostnames": data.get("hostnames", []),
+        "domains": data.get("domains", []),
+        "location": f"{data.get('city', '')}, {data.get('country_name', '')}",
+        "ports": data.get("ports", []),
+        "vulns": data.get("vulns", []), # CVEs
+        "tags": data.get("tags", []),
+        "last_update": data.get("last_update", "-"),
+    }
 
 def dns_lookup(domain: str) -> dict:
     domain = domain.strip()
@@ -398,9 +454,37 @@ def check_ssl_certificate(domain: str, port: int = 443) -> dict:
     }
 
 
+TLD_WHOIS_SERVERS = {
+    # Generic TLDs
+    "com": "whois.verisign-grs.com", "net": "whois.verisign-grs.com",
+    "org": "whois.pir.org", "info": "whois.afilias.info", "biz": "whois.biz",
+    "xyz": "whois.nic.xyz", "online": "whois.nic.online", "site": "whois.nic.site",
+    "club": "whois.nic.club", "app": "whois.nic.google", "dev": "whois.nic.google",
+    "io": "whois.nic.io", "co": "whois.nic.co", "ai": "whois.nic.ai",
+    "gg": "whois.gg", "me": "whois.nic.me", "tv": "whois.nic.tv",
+    "cc": "whois.nic.cc", "ws": "whois.nic.ws",
+    # Country-code TLDs
+    "de": "whois.denic.de", "uk": "whois.nic.uk", "ca": "whois.cira.ca",
+    "jp": "whois.jprs.jp", "au": "whois.auda.org.au", "ru": "whois.tcinet.ru",
+    "tr": "whois.nic.tr", "fr": "whois.nic.fr", "nl": "whois.domain-registry.nl",
+    "eu": "whois.eu", "cn": "whois.cnnic.cn", "in": "whois.registry.in",
+    "br": "whois.registro.br", "ch": "whois.nic.ch", "it": "whois.nic.it",
+    "es": "whois.nic.es", "se": "whois.iis.se", "pl": "whois.dns.pl",
+    "us": "whois.nic.us",
+}
+
+
 def whois_lookup(domain: str) -> str:
     domain = domain.strip().lower()
-    tld = domain.split(".")[-1]
+    # Handle URLs by extracting the domain
+    if "://" in domain:
+        domain = urllib.parse.urlparse(domain).netloc
+
+    parts = domain.split('.')
+    if len(parts) < 2:
+        return f"Geçersiz domain: {domain}"
+
+    tld = parts[-1]
 
     def query(server, q, port=43):
         with socket.create_connection((server, port), timeout=10) as s:
@@ -408,43 +492,49 @@ def whois_lookup(domain: str) -> str:
             resp = b""
             while True:
                 chunk = s.recv(4096)
-                if not chunk:
-                    break
+                if not chunk: break
                 resp += chunk
         return resp.decode(errors="ignore")
 
     def find_refer(text):
         for line in text.splitlines():
             low = line.lower()
-            if low.startswith("refer:") or low.startswith("whois server:") or low.startswith("whois:"):
-                return line.split(":", 1)[1].strip()
+            if low.strip().startswith("whois server:") or low.strip().startswith("refer:"):
+                server = line.split(":", 1)[1].strip()
+                if server and '.' in server: # Basic validation
+                    return server
         return None
 
+    # 1. Check our local list first for speed
+    whois_server = TLD_WHOIS_SERVERS.get(tld)
+
+    # 2. If not in our list, fall back to IANA
+    if not whois_server:
+        try:
+            iana_resp = query("whois.iana.org", tld)
+            whois_server = find_refer(iana_resp)
+            if not whois_server:
+                return f"'.{tld}' için authoritative WHOIS sunucusu bulunamadı.\n\n--- IANA yanıtı ---\n{iana_resp}"
+        except Exception as e:
+            return f"IANA whois sunucusuna bağlanılamadı: {e}\n(Ağ/firewall port 43'ü (WHOIS) engelliyor olabilir.)"
+
+    # 3. Query the authoritative server
     try:
-        iana_resp = query("whois.iana.org", domain)
+        main_resp = query(whois_server, domain)
     except Exception as e:
-        return f"IANA whois sunucusuna bağlanılamadı: {e}\n(Ağ/firewall port 43'ü (WHOIS) engelliyor olabilir.)"
+        return f"'{whois_server}' sunucusuna bağlanılamadı: {e}"
 
-    refer_server = find_refer(iana_resp)
-    if not refer_server:
-        return f"'.{tld}' için authoritative WHOIS sunucusu bulunamadı.\n\n--- IANA yanıtı ---\n{iana_resp}"
-
-    try:
-        second_resp = query(refer_server, domain)
-    except Exception as e:
-        return f"'{refer_server}' sunucusuna bağlanılamadı: {e}\n\n--- IANA yanıtı ---\n{iana_resp}"
-
-    # Bazı ccTLD'ler (örn. .co.uk gibi) ikinci bir sunucuya yönlendirme yapar
-    second_refer = find_refer(second_resp)
-    if second_refer and second_refer.lower() != refer_server.lower():
+    # 4. Handle second-level referrals (e.g., for .uk domains)
+    second_refer = find_refer(main_resp)
+    if second_refer and second_refer.lower() != whois_server.lower():
         try:
             third_resp = query(second_refer, domain)
-            if third_resp.strip():
+            if len(third_resp) > len(main_resp):
                 return third_resp
         except Exception:
-            pass
+            pass # If the third query fails, we still have the main response
 
-    return second_resp
+    return main_resp
 
 
 USERNAME_PLATFORMS = [
@@ -512,6 +602,39 @@ def analyze_email(email: str) -> dict:
                 pass
     return result
 
+def hibp_lookup(email: str, api_key: str = None) -> dict:
+    """Checks an email against the Have I Been Pwned API."""
+    if not REQUESTS_OK:
+        raise RuntimeError("requests kütüphanesi kurulu değil")
+    email = email.strip()
+    
+    headers = UA.copy()
+    if api_key:
+        headers["hibp-api-key"] = api_key
+    
+    try:
+        # HIBP requires a specific user agent if one is sent
+        headers["User-Agent"] = "GhostOSINT-Framework"
+        r = requests.get(f"https://haveibeenpwned.com/api/v3/breachedaccount/{urllib.parse.quote(email)}", headers=headers, timeout=15)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"HIBP API'ye bağlanılamadı: {e}")
+
+    if r.status_code == 404:
+        return {"pwned": False, "breaches": [], "count": 0}
+    if r.status_code == 401:
+        raise RuntimeError("Geçersiz veya eksik Have I Been Pwned API anahtarı (401).")
+    if r.status_code == 429:
+        raise RuntimeError("HIBP API rate limit aşıldı (429). API anahtarı kullanmayı veya bir süre beklemeyi deneyin.")
+    
+    r.raise_for_status() # For other errors
+
+    try:
+        data = r.json()
+        breach_names = sorted([b.get("Name") for b in data])
+        return {"pwned": True, "breaches": breach_names, "count": len(breach_names)}
+    except json.JSONDecodeError:
+        raise RuntimeError("HIBP API'den geçersiz JSON yanıtı alındı.")
+
 
 def identify_hash(h: str) -> list:
     h = h.strip()
@@ -573,6 +696,35 @@ def analyze_url(url: str) -> dict:
     except Exception as e:
         result["error"] = str(e)
     return result
+
+def take_url_screenshot(url: str, save_path: str):
+    """Takes a full-page screenshot of a URL using Playwright."""
+    if not PLAYWRIGHT_OK:
+        raise RuntimeError("Bu özellik için 'playwright' kütüphanesi gereklidir.\n\nLütfen GhostOSINT.bat dosyasını çalıştırarak kurulumu tamamlayın.")
+
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.launch()
+        except Exception as e:
+            raise RuntimeError(f"Playwright tarayıcısı başlatılamadı. Kurulumun tamamlandığından emin olun.\n\nDetay: {e}")
+        
+        page = browser.new_page(
+            user_agent=UA["User-Agent"],
+            viewport={'width': 1280, 'height': 1080} # A reasonable default viewport
+        )
+        try:
+            # Go to URL, wait for content to load
+            page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            # Wait a bit more for JS-heavy pages to render.
+            page.wait_for_timeout(3000)
+            page.screenshot(path=save_path, full_page=True)
+        except Exception as e:
+            browser.close()
+            raise RuntimeError(f"Sayfa yüklenemedi veya ekran görüntüsü alınamadı.\n\nDetay: {e}")
+        finally:
+            if browser.is_connected():
+                browser.close()
+    return save_path
 
 
 def decode_qr(path: str) -> str:
@@ -769,6 +921,24 @@ def find_subdomains(domain: str) -> list:
                 subs.add(line)
     return sorted(subs)
 
+def check_subdomain_liveness(subdomain: str):
+    """Checks a single subdomain for HTTP/HTTPS liveness. Returns a tuple."""
+    if not REQUESTS_OK:
+        return (subdomain, "HATA", "(requests yok)")
+
+    # Try HTTPS first
+    try:
+        # Use GET with stream=True, it's more reliable than HEAD and still fast.
+        r = requests.get(f"https://{subdomain}", headers=UA, timeout=4, allow_redirects=True, stream=True)
+        return (subdomain, r.status_code, r.url)
+    except requests.exceptions.RequestException:
+        # If anything goes wrong with HTTPS, fall back to HTTP
+        try:
+            r = requests.get(f"http://{subdomain}", headers=UA, timeout=4, allow_redirects=True, stream=True)
+            return (subdomain, r.status_code, r.url)
+        except requests.exceptions.RequestException:
+            # If HTTP also fails
+            return (subdomain, "ULAŞILAMADI", subdomain)
 
 def wayback_history(domain: str) -> dict:
     if not REQUESTS_OK:
@@ -1281,6 +1451,7 @@ class GhostOSINT(tk.Tk):
         self.report_is_dirty = False
         self.tab_results = {}
         self.tab_defs = []
+        self.found_subdomains = []
 
         try:
             # ICON_BASE64 global olarak tanımlı olmalı
@@ -1331,7 +1502,7 @@ class GhostOSINT(tk.Tk):
         settings_menu.add_command(label="Sekme Yöneticisi...", command=self._show_tab_manager_window)
         settings_menu.add_separator()
         settings_menu.add_command(label="Hakkında", command=self._show_about_window)
-        settings_menu.add_command(label="GitHub'da Görüntüle", command=lambda: webbrowser.open("https://github.com/TarikPro43391/GHOST-OSINT-FRAMEWORK"))
+        settings_menu.add_command(label="GitHub'da Görüntüle", command=lambda: webbrowser.open("https://github.com/TarikPro43391/GhostOSINT"))
 
     # ---------- STYLE ----------
     def _build_style(self):
@@ -1591,6 +1762,7 @@ class GhostOSINT(tk.Tk):
                     ("JSON Dosyası", "*.json"),
                     ("CSV Dosyası", "*.csv"),
                     ("HTML Dosyası", "*.html"),
+                    ("PDF Dosyası", "*.pdf"),
                     ("Tüm Dosyalar", "*.*")
                 ],
                 title="Raporu Kaydet",
@@ -1606,6 +1778,8 @@ class GhostOSINT(tk.Tk):
                 self._export_as_csv(file_path)
             elif extension.lower() == ".html":
                 self._export_as_html(file_path)
+            elif extension.lower() == ".pdf":
+                self._export_as_pdf(file_path)
             else: # Default to TXT
                 self._export_as_txt(file_path)
 
@@ -1614,6 +1788,7 @@ class GhostOSINT(tk.Tk):
             self.report_is_dirty = False
         except Exception as e:
             messagebox.showerror("Hata", f"Rapor kaydedilirken bir hata oluştu:\n{e}")
+            self.set_status("Rapor kaydetme başarısız.")
 
     def _export_as_txt(self, file_path):
         report_lines = []
@@ -1687,6 +1862,29 @@ class GhostOSINT(tk.Tk):
             raise IOError(f"CSV dosyası yazılırken hata oluştu: {e}")
 
     def _export_as_html(self, file_path):
+        html_content = self._generate_html_report_content()
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+    def _export_as_pdf(self, file_path):
+        if not XHTML2PDF_OK:
+            raise RuntimeError("PDF oluşturmak için 'xhtml2pdf' kütüphanesi gereklidir.\n\nLütfen kurun: pip install xhtml2pdf")
+
+        self.set_status("HTML rapor içeriği oluşturuluyor...")
+        html_content = self._generate_html_report_content()
+        self.set_status("PDF dosyası oluşturuluyor (bu işlem biraz sürebilir)...")
+
+        with open(file_path, "w+b") as f:
+            pisa_status = pisa.CreatePDF(
+                html_content,
+                dest=f,
+                encoding='utf-8'
+            )
+
+        if pisa_status.err:
+            raise RuntimeError(f"PDF oluşturma hatası. Kod: {pisa_status.err}. Rapor çok büyük veya karmaşık olabilir.")
+
+    def _generate_html_report_content(self):
         import html as html_escaper
         theme = self.theme
 
@@ -1772,8 +1970,7 @@ class GhostOSINT(tk.Tk):
                 else: html_content += f"<pre>{linkify(result_data)}</pre>"
             html_content += "</div>"
         html_content += "</div></body></html>"
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
+        return html_content
 
     def _clear_all_outputs(self):
         if not self.report_is_dirty:
@@ -2095,12 +2292,99 @@ class GhostOSINT(tk.Tk):
 
         self._run_async(task, done)
 
+    def _save_shodan_key(self):
+        key = self.shodan_key_entry.get().strip()
+        self.app_config["shodan_api_key"] = key
+        save_config(self.app_config)
+        self.set_status("Shodan API anahtarı kaydedildi.")
+        # Enable/disable button based on key presence
+        state = "normal" if key else "disabled"
+        self.shodan_lookup_button.config(state=state)
+
+    def _save_hibp_key(self):
+        key = self.hibp_key_entry.get().strip()
+        self.app_config["hibp_api_key"] = key
+        save_config(self.app_config)
+        self.set_status("Have I Been Pwned API anahtarı kaydedildi.")
+
     # ================= IP TAB =================
     def _build_ip_tab(self):
         t = self.tab_ip
         self.ip_entry = self._labeled_entry(t, "IP Adresi:")
-        ttk.Button(t, text="IP SORGULA", command=self._on_ip_lookup).pack(anchor="w", pady=6)
+        ttk.Button(t, text="IP SORGULA (ip-api.com)", command=self._on_ip_lookup).pack(anchor="w", pady=6)
+        
+        # Separator
+        l_sep = tk.Label(t, text="─── Shodan Entegrasyonu ───", bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9))
+        l_sep.pack(fill="x", pady=(14, 2))
+        self.tracked_widgets.append((l_sep, {"bg": "BG", "fg": "FG_DIM"}))
+
+        # Shodan API Key Entry
+        key_row = tk.Frame(t, bg=self.theme["BG"])
+        key_row.pack(fill="x", pady=4)
+        self.tracked_widgets.append((key_row, {"bg": "BG"}))
+        l = tk.Label(key_row, text="Shodan API Key:", bg=self.theme["BG"], fg=self.theme["FG"], font=FONT, width=16, anchor="w")
+        l.pack(side="left")
+        self.tracked_widgets.append((l, {"bg": "BG", "fg": "FG"}))
+        self.shodan_key_entry = ttk.Entry(key_row, width=40, font=FONT_MONO, show="*")
+        self.shodan_key_entry.pack(side="left", padx=6, fill="x", expand=True)
+        self.shodan_key_entry.insert(0, self.app_config.get("shodan_api_key", ""))
+        
+        ttk.Button(key_row, text="Anahtarı Kaydet", command=self._save_shodan_key, style="Clear.TButton").pack(side="right", padx=(0, 6))
+
+        # Shodan Lookup Button
+        self.shodan_lookup_button = ttk.Button(t, text="SHODAN SORGULA", style="Blue.TButton", command=self._on_shodan_lookup)
+        self.shodan_lookup_button.pack(anchor="w", pady=6)
+        
+        # Initial state of the button
+        if not self.shodan_key_entry.get():
+            self.shodan_lookup_button.config(state="disabled")
+
         self.ip_output = self._output_box(t, tab_name="IP LOOKUP")
+
+    def _on_shodan_lookup(self):
+        ip = self.ip_entry.get().strip()
+        api_key = self.shodan_key_entry.get().strip()
+        if not ip:
+            messagebox.showerror("Hata", "IP adresi girin.")
+            return
+        if not api_key:
+            messagebox.showerror("Hata", "Shodan API anahtarı girin ve kaydedin.")
+            return
+        
+        self.set_status(f"Shodan'da '{ip}' sorgulanıyor...")
+        self._write(self.ip_output, f"Shodan'da '{ip}' sorgulanıyor, lütfen bekleyin...\n")
+
+        def done(result, err):
+            if err:
+                messagebox.showerror("Hata", str(err))
+                self.set_status("Shodan sorgusu başarısız.")
+                return
+            
+            ports = "\n  ".join(str(p) for p in result.get("ports", [])) or "Yok"
+            vulns = "\n  ".join(v for v in result.get("vulns", [])) or "Yok"
+            hostnames = "\n  ".join(h for h in result.get("hostnames", [])) or "Yok"
+            domains = "\n  ".join(d for d in result.get("domains", [])) or "Yok"
+
+            out = (
+                f"[SHODAN HOST LOOKUP: {result.get('ip')}]\n"
+                f"Organizasyon: {result.get('organization')}\n"
+                f"OS          : {result.get('os')}\n"
+                f"ISP         : {result.get('isp')}\n"
+                f"ASN         : {result.get('asn')}\n"
+                f"Konum       : {result.get('location')}\n"
+                f"Son Güncelleme: {result.get('last_update')}\n"
+                f"Etiketler   : {', '.join(result.get('tags', [])) or 'Yok'}\n\n"
+                f"Hostnames:\n  {hostnames}\n\n"
+                f"Domains:\n  {domains}\n\n"
+                f"Açık Portlar:\n  {ports}\n\n"
+                f"Bilinen Zafiyetler (CVEs):\n  {vulns}\n\n"
+                f"Detaylı bilgi için: https://www.shodan.io/host/{result.get('ip')}\n"
+            )
+            self._write(self.ip_output, out)
+            self.tab_results.setdefault("IP LOOKUP", {"input": ip})["shodan"] = result
+            self.set_status("Shodan sorgusu tamamlandı.")
+
+        self._run_async(lambda: shodan_lookup(ip, api_key), done)
 
     def _on_ip_lookup(self):
         ip = self.ip_entry.get().strip()
@@ -2129,7 +2413,7 @@ class GhostOSINT(tk.Tk):
                 f"\nHarita: https://www.google.com/maps?q={result.get('lat')},{result.get('lon')}\n"
             )
             self._write(self.ip_output, out)
-            self.tab_results["IP LOOKUP"] = {"input": ip, "output": result}
+            self.tab_results.setdefault("IP LOOKUP", {"input": ip})["ip-api"] = result
             self.set_status("IP lookup tamamlandı.")
 
         self._run_async(lambda: ip_lookup(ip), done)
@@ -2232,8 +2516,74 @@ class GhostOSINT(tk.Tk):
     def _build_email_tab(self):
         t = self.tab_email
         self.email_entry = self._labeled_entry(t, "Email Adresi:")
-        ttk.Button(t, text="ANALİZ ET", command=self._on_email_analyze).pack(anchor="w", pady=6)
+        
+        btn_row = tk.Frame(t, bg=self.theme["BG"])
+        btn_row.pack(fill="x", pady=6)
+        self.tracked_widgets.append((btn_row, {"bg": "BG"}))
+        
+        ttk.Button(btn_row, text="FORMAT/MX ANALİZ ET", command=self._on_email_analyze).pack(side="left")
+
+        # Separator for HIBP
+        l_sep = tk.Label(t, text="─── Have I Been Pwned (HIBP) Entegrasyonu ───", bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9))
+        l_sep.pack(fill="x", pady=(14, 2))
+        self.tracked_widgets.append((l_sep, {"bg": "BG", "fg": "FG_DIM"}))
+
+        # HIBP API Key Entry
+        key_row = tk.Frame(t, bg=self.theme["BG"])
+        key_row.pack(fill="x", pady=4)
+        self.tracked_widgets.append((key_row, {"bg": "BG"}))
+        l = tk.Label(key_row, text="HIBP API Key:", bg=self.theme["BG"], fg=self.theme["FG"], font=FONT, width=16, anchor="w")
+        l.pack(side="left")
+        self.tracked_widgets.append((l, {"bg": "BG", "fg": "FG"}))
+        self.hibp_key_entry = ttk.Entry(key_row, width=40, font=FONT_MONO, show="*")
+        self.hibp_key_entry.pack(side="left", padx=6, fill="x", expand=True)
+        self.hibp_key_entry.insert(0, self.app_config.get("hibp_api_key", ""))
+        
+        ttk.Button(key_row, text="Anahtarı Kaydet", command=self._save_hibp_key, style="Clear.TButton").pack(side="right", padx=(0, 6))
+
+        # HIBP Lookup Button
+        self.hibp_lookup_button = ttk.Button(t, text="HAVE I BEEN PWNED? SORGULA", style="Blue.TButton", command=self._on_hibp_lookup)
+        self.hibp_lookup_button.pack(anchor="w", pady=6)
+        
+        l_hibp_note = tk.Label(t, text="API anahtarı olmadan rate limit çok düşüktür (1 sorgu/2sn). Anahtar https://haveibeenpwned.com/API/Key adresinden alınabilir.", bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9), justify="left")
+        l_hibp_note.pack(anchor="w")
+        self.tracked_widgets.append((l_hibp_note, {"bg": "BG", "fg": "FG_DIM"}))
+
         self.email_output = self._output_box(t, tab_name="EMAIL")
+
+    def _on_hibp_lookup(self):
+        email = self.email_entry.get().strip()
+        api_key = self.hibp_key_entry.get().strip()
+        if not email:
+            messagebox.showerror("Hata", "Email adresi girin.")
+            return
+        
+        self.set_status(f"Have I Been Pwned'de '{email}' sorgulanıyor...")
+        self._write(self.email_output, f"HIBP'de '{email}' sorgulanıyor, lütfen bekleyin...\n")
+
+        def done(result, err):
+            if err:
+                messagebox.showerror("Hata", str(err))
+                self.set_status("HIBP sorgusu başarısız.")
+                return
+            
+            if not result["pwned"]:
+                out = (f"[HAVE I BEEN PWNED?: {email}]\n\n"
+                       f"SONUÇ: Bu email adresi bilinen veri sızıntılarında bulunamadı. ✓")
+            else:
+                breaches = "\n  - ".join(result.get("breaches", []))
+                out = (
+                    f"[HAVE I BEEN PWNED?: {email}]\n\n"
+                    f"DİKKAT: Bu email adresi {result['count']} veri sızıntısında bulundu!\n\n"
+                    f"Sızıntıların Listesi:\n  - {breaches}\n\n"
+                    f"Detaylı bilgi için: https://haveibeenpwned.com/account/{urllib.parse.quote(email)}"
+                )
+            
+            self._write(self.email_output, out)
+            self.tab_results.setdefault("EMAIL", {"input": email})["hibp"] = result
+            self.set_status("Have I Been Pwned sorgusu tamamlandı.")
+
+        self._run_async(lambda: hibp_lookup(email, api_key), done)
 
     def _on_email_analyze(self):
         email = self.email_entry.get().strip()
@@ -2249,14 +2599,14 @@ class GhostOSINT(tk.Tk):
             mx = "\n  ".join(result["mx"]) or ("Bulunamadı" if DNSPYTHON_OK else "(dnspython kurulu değil)")
             a = "\n  ".join(result["a_record"]) or "Bulunamadı"
             out = (
-                f"[EMAIL: {email}]\n"
+                f"[EMAIL FORMAT/MX ANALİZİ: {email}]\n"
                 f"Format Geçerli mi?: {'Evet' if result['valid_format'] else 'Hayır'}\n"
                 f"Domain            : {result['domain']}\n"
                 f"Domain A Kaydı    :\n  {a}\n\n"
                 f"MX Kayıtları      :\n  {mx}\n"
             )
             self._write(self.email_output, out)
-            self.tab_results["EMAIL"] = {"input": email, "output": result}
+            self.tab_results.setdefault("EMAIL", {"input": email})["analysis"] = result
             self.set_status("Email analiz tamamlandı.")
 
         self._run_async(lambda: analyze_email(email), done)
@@ -2321,13 +2671,61 @@ class GhostOSINT(tk.Tk):
     def _build_url_tab(self):
         t = self.tab_url
         self.url_entry = self._labeled_entry(t, "URL:", width=60)
-        ttk.Button(t, text="URL ANALİZ ET", command=self._on_url_analyze).pack(anchor="w", pady=6)
+
+        btn_row = tk.Frame(t, bg=self.theme["BG"])
+        btn_row.pack(fill="x", pady=6)
+        self.tracked_widgets.append((btn_row, {"bg": "BG"}))
+
+        ttk.Button(btn_row, text="URL ANALİZ ET", command=self._on_url_analyze).pack(side="left")
+        ttk.Button(btn_row, text="EKRAN GÖRÜNTÜSÜ AL", style="Blue.TButton", command=self._on_url_screenshot).pack(side="left", padx=8)
 
         l = tk.Label(t, text="─── QR Kod Decode (resimden) ───", bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9)); l.pack(anchor="w", pady=(10, 4)); self.tracked_widgets.append((l, {"bg": "BG", "fg": "FG_DIM"}))
-        ttk.Button(t, text="RESİM SEÇ VE QR OKU", style="Blue.TButton",
+        ttk.Button(t, text="RESİM SEÇ VE QR OKU", style="Clear.TButton",
                    command=self._on_qr_decode).pack(anchor="w")
 
         self.url_output = self._output_box(t, tab_name="URL / QR")
+
+    def _on_url_screenshot(self):
+        if not PLAYWRIGHT_OK:
+            messagebox.showerror("Hata", "Bu özellik için 'playwright' kütüphanesi gereklidir.\n\nLütfen GhostOSINT.bat dosyasını çalıştırarak kurulumu tamamlayın.")
+            return
+
+        url = self.url_entry.get().strip()
+        if not url:
+            messagebox.showerror("Hata", "URL girin.")
+            return
+        if not url.lower().startswith(("http://", "https://")):
+            url = "http://" + url
+
+        domain = urllib.parse.urlparse(url).netloc or "url"
+        initial_filename = f"screenshot_{domain.replace('.', '_')}_{datetime.now().strftime('%Y%m%d_%H%M')}.png"
+        save_path = filedialog.asksaveasfilename(
+            title="Ekran Görüntüsünü Kaydet", initialfile=initial_filename, defaultextension=".png",
+            filetypes=[("PNG Image", "*.png"), ("All files", "*.*")]
+        )
+        if not save_path: return
+
+        self.set_status(f"'{url}' için ekran görüntüsü alınıyor...")
+        self._write(self.url_output, f"Ekran görüntüsü alınıyor, lütfen bekleyin...\nBu işlem 30 saniyeye kadar sürebilir.\n\nURL: {url}\n")
+
+        def done(result_path, err):
+            if err:
+                messagebox.showerror("Hata", f"Ekran görüntüsü alınamadı:\n{err}", parent=self)
+                self.set_status("Ekran görüntüsü alma başarısız.")
+                return
+            
+            out = f"\nEkran görüntüsü başarıyla alındı ve kaydedildi.\n\nDosya Yolu: {result_path}"
+            self._append_to_output(self.url_output, out)
+            self.tab_results.setdefault("URL / QR", {})["screenshot"] = {"input": url, "output": result_path}
+            self.set_status("Ekran görüntüsü alındı.")
+            
+            if messagebox.askyesno("Başarılı", "Ekran görüntüsü kaydedildi.\n\nDosyayı şimdi açmak ister misiniz?", parent=self):
+                try:
+                    os.startfile(os.path.normpath(result_path))
+                except Exception as e:
+                    messagebox.showwarning("Hata", f"Dosya açılamadı: {e}", parent=self)
+
+        self._run_async(lambda: take_url_screenshot(url, save_path), done)
 
     def _on_url_analyze(self):
         url = self.url_entry.get().strip()
@@ -2487,9 +2885,57 @@ class GhostOSINT(tk.Tk):
     def _build_subdomain_tab(self):
         t = self.tab_subdomain
         self.subdomain_entry = self._labeled_entry(t, "Domain:")
-        ttk.Button(t, text="SUBDOMAIN ARA (crt.sh)", command=self._on_subdomain_search).pack(anchor="w", pady=6)
+
+        btn_row = tk.Frame(t, bg=self.theme["BG"])
+        btn_row.pack(fill="x", pady=6)
+        self.tracked_widgets.append((btn_row, {"bg": "BG"}))
+
+        ttk.Button(btn_row, text="SUBDOMAIN ARA (crt.sh)", command=self._on_subdomain_search).pack(side="left")
+
+        self.subdomain_check_button = ttk.Button(btn_row, text="BULUNANLARI KONTROL ET", style="Blue.TButton", command=self._on_subdomain_check)
+        self.subdomain_check_button.pack(side="left", padx=8)
+        self.subdomain_check_button.config(state="disabled")
+
         l = tk.Label(t, text="Sertifika şeffaflığı (Certificate Transparency) loglarından public subdomain listesi çeker.", bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9)); l.pack(anchor="w"); self.tracked_widgets.append((l, {"bg": "BG", "fg": "FG_DIM"}))
         self.subdomain_output = self._output_box(t, tab_name="SUBDOMAIN")
+
+    def _on_subdomain_check(self):
+        if not self.found_subdomains:
+            messagebox.showinfo("Bilgi", "Önce 'SUBDOMAIN ARA' butonu ile bir arama yapmalısınız.")
+            return
+
+        total = len(self.found_subdomains)
+        self.set_status(f"Toplam {total} subdomain kontrol ediliyor...")
+        self.subdomain_check_button.config(state="disabled")
+        self._write(self.subdomain_output, f"Kontrol ediliyor, lütfen bekleyin ({total} adet, paralel taranıyor)...\n\n")
+
+        def task():
+            results = []
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                futures = {executor.submit(check_subdomain_liveness, sub): sub for sub in self.found_subdomains}
+                for future in concurrent.futures.as_completed(futures):
+                    results.append(future.result())
+            return results
+
+        def done(results, err):
+            if err:
+                messagebox.showerror("Hata", str(err))
+                self.set_status("Subdomain kontrolü başarısız.")
+                self.subdomain_check_button.config(state="normal")
+                return
+
+            domain = self.subdomain_entry.get().strip()
+            lines = [f"[SUBDOMAIN CANLILIK KONTROLÜ: {domain}]\n"]
+            # Sort by status type (int vs str), then by status value
+            for sub, status, url in sorted(results, key=lambda x: (isinstance(x[1], str), x[1])):
+                lines.append(f"[{str(status):<11}] {sub}")
+
+            self._write(self.subdomain_output, "\n".join(lines))
+            self.tab_results.setdefault("SUBDOMAIN", {"input": domain})["liveness_check"] = results
+            self.set_status("Subdomain kontrolü tamamlandı.")
+            self.subdomain_check_button.config(state="normal")
+
+        self._run_async(task, done)
 
     def _on_subdomain_search(self):
         domain = self.subdomain_entry.get().strip()
@@ -2503,14 +2949,20 @@ class GhostOSINT(tk.Tk):
             if err:
                 messagebox.showerror("Hata", str(err))
                 self.set_status("Subdomain arama başarısız.")
+                self.subdomain_check_button.config(state="disabled")
                 return
+
+            self.found_subdomains = result
+
             if not result:
                 self._write(self.subdomain_output, f"[SUBDOMAIN: {domain}]\n\nSonuç bulunamadı.")
+                self.subdomain_check_button.config(state="disabled")
             else:
                 out = f"[SUBDOMAIN: {domain}] — {len(result)} sonuç\n\n" + "\n".join(result)
                 self._write(self.subdomain_output, out)
+                self.subdomain_check_button.config(state="normal")
             self.set_status("Subdomain arama tamamlandı.")
-            self.tab_results["SUBDOMAIN"] = {"input": domain, "output": result}
+            self.tab_results.setdefault("SUBDOMAIN", {"input": domain})["found_subdomains"] = result
 
         self._run_async(lambda: find_subdomains(domain), done)
 
@@ -2962,6 +3414,90 @@ class GhostOSINT(tk.Tk):
                 self.after(0, self.set_status, "SQLi testi başarısız.")
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ================= BASE64 TAB =================
+    def _build_base64_tab(self):
+        t = self.tab_base64
+        
+        input_frame = tk.Frame(t, bg=self.theme["BG"])
+        input_frame.pack(fill="both", expand=True, pady=(0, 5))
+        self.tracked_widgets.append((input_frame, {"bg": "BG"}))
+
+        tk.Label(input_frame, text="Metin (Plain Text)", bg=self.theme["BG"], fg=self.theme["FG_DIM"]).pack(anchor="w")
+        self.base64_input_text = tk.Text(input_frame, height=8, bg=self.theme["PANEL2"], fg=self.theme["FG"], insertbackground=self.theme["FG"], font=FONT_MONO, relief="flat", wrap="word", padx=10, pady=10, borderwidth=1, highlightthickness=1, highlightbackground=self.theme["BORDER"], highlightcolor=self.theme["BLUE"])
+        self.base64_input_text.pack(fill="both", expand=True, pady=(2,0))
+
+        button_frame = tk.Frame(t, bg=self.theme["BG"])
+        button_frame.pack(fill="x", pady=5)
+        self.tracked_widgets.append((button_frame, {"bg": "BG"}))
+
+        ttk.Button(button_frame, text="▼ ENCODE ▼", command=self._on_base64_encode).pack(side="left", expand=True, padx=5)
+        ttk.Button(button_frame, text="▲ DECODE ▲", command=self._on_base64_decode, style="Blue.TButton").pack(side="right", expand=True, padx=5)
+
+        output_frame = tk.Frame(t, bg=self.theme["BG"])
+        output_frame.pack(fill="both", expand=True, pady=(5, 0))
+        self.tracked_widgets.append((output_frame, {"bg": "BG"}))
+
+        tk.Label(output_frame, text="Base64", bg=self.theme["BG"], fg=self.theme["FG_DIM"]).pack(anchor="w")
+        self.base64_output_text = tk.Text(output_frame, height=8, bg=self.theme["PANEL2"], fg=self.theme["FG"], insertbackground=self.theme["FG"], font=FONT_MONO, relief="flat", wrap="word", padx=10, pady=10, borderwidth=1, highlightthickness=1, highlightbackground=self.theme["BORDER"], highlightcolor=self.theme["BLUE"])
+        self.base64_output_text.pack(fill="both", expand=True, pady=(2,0))
+
+    def _on_base64_encode(self):
+        try:
+            plain_text = self.base64_input_text.get("1.0", "end-1c")
+            if not plain_text:
+                self.set_status("Kodlanacak metin girilmedi.")
+                return
+            encoded = base64.b64encode(plain_text.encode("utf-8")).decode("utf-8")
+            self.base64_output_text.delete("1.0", "end")
+            self.base64_output_text.insert("1.0", encoded)
+            self.set_status("Metin başarıyla Base64'e kodlandı.")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Kodlama sırasında hata: {e}")
+
+    def _on_base64_decode(self):
+        try:
+            base64_text = self.base64_output_text.get("1.0", "end-1c").strip()
+            if not base64_text:
+                self.set_status("Çözülecek Base64 verisi girilmedi.")
+                return
+            missing_padding = len(base64_text) % 4
+            if missing_padding:
+                base64_text += '=' * (4 - missing_padding)
+            decoded = base64.b64decode(base64_text).decode("utf-8", errors="replace")
+            self.base64_input_text.delete("1.0", "end")
+            self.base64_input_text.insert("1.0", decoded)
+            self.set_status("Base64 başarıyla metne çözüldü.")
+        except (base64.binascii.Error, UnicodeDecodeError) as e:
+            messagebox.showerror("Hata", f"Geçersiz Base64 verisi veya formatı.\n\nDetay: {e}")
+        except Exception as e:
+            messagebox.showerror("Hata", f"Çözme sırasında hata: {e}")
+
+    # ================= BITCOIN TAB =================
+    def _build_btc_tab(self):
+        t = self.tab_btc
+        self.btc_entry = self._labeled_entry(t, "Bitcoin Adresi:", width=50)
+        ttk.Button(t, text="ADRESİ KONTROL ET", command=self._on_btc_lookup).pack(anchor="w", pady=6)
+        l = tk.Label(t, text="Girilen adres için public block explorer linki oluşturur.", bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9)); l.pack(anchor="w"); self.tracked_widgets.append((l, {"bg": "BG", "fg": "FG_DIM"}))
+        self.btc_output = self._output_box(t, tab_name="BITCOIN")
+
+    def _on_btc_lookup(self):
+        address = self.btc_entry.get().strip()
+        if not address:
+            messagebox.showerror("Hata", "Bitcoin adresi girin.")
+            return
+        if not re.match(r"^(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,39}$", address):
+             if not messagebox.askyesno("Uyarı", "Girilen metin geçerli bir Bitcoin adresine benzemiyor. Yine de devam edilsin mi?"):
+                 return
+        explorer_url = f"https://www.blockchain.com/btc/address/{address}"
+        out = (f"[BITCOIN ADRES KONTROLÜ]\n"
+               f"Adres: {address}\n\n"
+               f"Aşağıdaki linke tıklayarak bu adresin işlem geçmişini, bakiyesini ve\n"
+               f"diğer public bilgilerini bir block explorer üzerinde görebilirsiniz:\n\n"
+               f"{explorer_url}\n")
+        self._write(self.btc_output, out)
+        self.tab_results["BITCOIN"] = {"input": address, "output": {"explorer_url": explorer_url}}
+        self.set_status("Bitcoin block explorer linki oluşturuldu.")
 
 if __name__ == "__main__":
     app = GhostOSINT()
