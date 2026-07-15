@@ -1,6 +1,6 @@
 """
 ================================================================
- GHOST OSINT FRAMEWORK v0.1.3 (Alpha) - GUI EDITION
+ GHOST OSINT FRAMEWORK v0.1.5 (Alpha) - GUI EDITION
  by TarikPro43391
 ================================================================
 Modüller:
@@ -33,7 +33,7 @@ import socket
 import re
 import json
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import webbrowser
 import os
@@ -87,24 +87,24 @@ except ImportError:
 CONFIG_FILE = "ghost_osint_config.json"
 
 ALL_TAB_DEFS = [
-    ("discord", "DISCORD ID"), ("ip", "IP LOOKUP"), ("domain", "DOMAIN/DNS"),
+    ("discord", "DISCORD ID"), ("ip", "IP LOOKUP"), ("domain", "DOMAIN/DNS"), ("reputation", "İTİBAR KONTROLÜ"),
     ("username", "USERNAME"), ("email", "EMAIL"), ("hash", "HASH"),
     ("phone", "PHONE"), ("url", "URL/QR"), ("exif", "EXIF"),
     ("mac", "MAC VENDOR"), ("ua", "USER-AGENT"), ("subdomain", "SUBDOMAIN"),
     ("wayback", "WAYBACK"), ("breach", "BREACH"), ("portscan", "PORT SCAN"),
-    ("leak", "LEAK SEARCH"), ("pastebin", "PASTEBIN"),
-    ("invite", "INVITE"), ("ssl", "SSL"), ("iban", "IBAN"),
-    ("bin", "BIN LOOKUP"), ("xss", "XSS"), ("sql", "SQLi")
+    ("leak", "LEAK SEARCH"), ("leakpeek", "LEAK PEEK"),
+    ("invite", "INVITE"), ("ssl", "SSL"), ("iban", "IBAN"), ("bin", "BIN LOOKUP")
 ]
 
-ALL_TAB_DEFS.extend([("base64", "BASE64"), ("btc", "BITCOIN")])
+# Pentest ve diğer araçlar
+ALL_TAB_DEFS.extend([("xss", "XSS SCAN"), ("sql", "SQLi SCAN"), ("base64", "BASE64"), ("btc", "BITCOIN")])
 
 def get_default_config():
     """Returns the default application configuration."""
     return {
         "visible_tabs": [name for name, text in ALL_TAB_DEFS],
-        "shodan_api_key": "",
-        "hibp_api_key": ""
+        "abuseipdb_api_key": "",
+        "virustotal_api_key": "",
     }
 
 def load_config():
@@ -129,7 +129,7 @@ def save_config(config):
         messagebox.showerror("Hata", f"Ayarlar kaydedilemedi: {e}")
 
 # ================= VERSION =================
-CURRENT_VERSION = "v0.1.3"
+CURRENT_VERSION = "v0.1.5"
 # Gerçek bir repo URL'si ile değiştirin. version.json dosyası {"latest_version": "vX.Y.Z", "release_url": "..."} formatında olmalı.
 VERSION_CHECK_URL = "https://raw.githubusercontent.com/TarikPro43391/GhostOSINT/main/version.json"
 
@@ -350,55 +350,13 @@ def ip_lookup(ip: str) -> dict:
         raise RuntimeError(data.get("message", "IP bulunamadı"))
     return data
 
-def shodan_lookup(ip: str, api_key: str) -> dict:
-    if not REQUESTS_OK:
-        raise RuntimeError("requests kütüphanesi kurulu değil")
-    if not api_key:
-        raise ValueError("Shodan API anahtarı gerekli.")
-
-    ip = ip.strip()
-    try:
-        r = requests.get(f"https://api.shodan.io/shodan/host/{ip}?key={api_key}", headers=UA, timeout=15)
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Shodan API'ye bağlanılamadı: {e}")
-
-    if r.status_code == 401:
-        raise RuntimeError("Geçersiz Shodan API anahtarı (401).")
-    if r.status_code == 404:
-        raise RuntimeError("Shodan'da bu IP için bilgi bulunamadı (404).")
-    if r.status_code == 429:
-        raise RuntimeError("Shodan API rate limit aşıldı (429).")
-    
-    r.raise_for_status() # For other 4xx/5xx errors
-
-    try:
-        data = r.json()
-    except json.JSONDecodeError:
-        raise RuntimeError("Shodan API'den geçersiz JSON yanıtı alındı.")
-
-    # Extract relevant data
-    return {
-        "ip": data.get("ip_str"),
-        "organization": data.get("org", "-"),
-        "os": data.get("os", "-"),
-        "isp": data.get("isp", "-"),
-        "asn": data.get("asn", "-"),
-        "hostnames": data.get("hostnames", []),
-        "domains": data.get("domains", []),
-        "location": f"{data.get('city', '')}, {data.get('country_name', '')}",
-        "ports": data.get("ports", []),
-        "vulns": data.get("vulns", []), # CVEs
-        "tags": data.get("tags", []),
-        "last_update": data.get("last_update", "-"),
-    }
-
 def dns_lookup(domain: str) -> dict:
     domain = domain.strip()
     result = {"A": [], "MX": [], "raw_error": None}
     try:
         result["A"] = list({ip for ip in socket.gethostbyname_ex(domain)[2]})
     except socket.gaierror as e:
-        result["raw_error"] = str(e)
+        result["raw_error"] = f"Host ('{domain}') çözülemedi. Domain adını kontrol edin veya ağ bağlantınızı test edin."
 
     if DNSPYTHON_OK:
         try:
@@ -421,7 +379,14 @@ def check_ssl_certificate(domain: str, port: int = 443) -> dict:
                 cipher = ssock.cipher()
                 tls_version = ssock.version()
     except socket.gaierror as e:
-        raise RuntimeError(f"Host çözülemedi: {e}")
+        error_message = (
+            f"Host ('{domain}') çözülemedi.\n\n"
+            "Bu hata genellikle şu nedenlerden kaynaklanır:\n"
+            " - Domain adı yanlış yazılmış.\n"
+            " - Domain adı mevcut değil veya süresi dolmuş.\n"
+            " - İnternet bağlantınızda veya DNS ayarlarınızda bir sorun var."
+        )
+        raise RuntimeError(error_message) from e
     except ssl.SSLCertVerificationError as e:
         raise RuntimeError(f"Sertifika doğrulanamadı (geçersiz/kendinden imzalı olabilir): {e}")
     except (socket.timeout, ConnectionRefusedError, OSError) as e:
@@ -515,12 +480,16 @@ def whois_lookup(domain: str) -> str:
             whois_server = find_refer(iana_resp)
             if not whois_server:
                 return f"'.{tld}' için authoritative WHOIS sunucusu bulunamadı.\n\n--- IANA yanıtı ---\n{iana_resp}"
+        except socket.gaierror:
+            return "IANA WHOIS sunucusu ('whois.iana.org') çözümlenemedi. İnternet bağlantınızı kontrol edin."
         except Exception as e:
             return f"IANA whois sunucusuna bağlanılamadı: {e}\n(Ağ/firewall port 43'ü (WHOIS) engelliyor olabilir.)"
 
     # 3. Query the authoritative server
     try:
         main_resp = query(whois_server, domain)
+    except socket.gaierror:
+        return f"WHOIS sunucusu ('{whois_server}') çözümlenemedi. İnternet bağlantınızı kontrol edin."
     except Exception as e:
         return f"'{whois_server}' sunucusuna bağlanılamadı: {e}"
 
@@ -531,11 +500,87 @@ def whois_lookup(domain: str) -> str:
             third_resp = query(second_refer, domain)
             if len(third_resp) > len(main_resp):
                 return third_resp
+        except socket.gaierror:
+            # Referral sunucusu çözümlenemezse, görmezden gel ve önceki yanıtı döndür.
+            pass
         except Exception:
             pass # If the third query fails, we still have the main response
 
     return main_resp
 
+def abuseipdb_check(ip: str, api_key: str) -> dict:
+    if not REQUESTS_OK:
+        raise RuntimeError("requests kütüphanesi kurulu değil")
+    if not api_key:
+        raise ValueError("AbuseIPDB API anahtarı gerekli.")
+
+    ip = ip.strip()
+    headers = {
+        'Accept': 'application/json',
+        'Key': api_key
+    }
+    params = {
+        'ipAddress': ip,
+        'maxAgeInDays': '90',
+        'verbose': True
+    }
+    try:
+        r = requests.get("https://api.abuseipdb.com/api/v2/check", headers=headers, params=params, timeout=15)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"AbuseIPDB API'ye bağlanılamadı: {e}")
+
+    if r.status_code == 401:
+        raise RuntimeError("Geçersiz AbuseIPDB API anahtarı (401).")
+    if r.status_code == 429:
+        raise RuntimeError("AbuseIPDB API rate limit aşıldı (429).")
+    if r.status_code == 422:
+        try:
+            error_detail = r.json()['errors'][0]['detail']
+            raise RuntimeError(f"Geçersiz istek: {error_detail} (422).")
+        except (json.JSONDecodeError, KeyError, IndexError):
+             raise RuntimeError("AbuseIPDB'den geçersiz istek yanıtı (422).")
+
+    r.raise_for_status()
+
+    try:
+        data = r.json().get('data', {})
+    except json.JSONDecodeError:
+        raise RuntimeError("AbuseIPDB API'den geçersiz JSON yanıtı alındı.")
+
+    return data
+
+def virustotal_domain_report(domain: str, api_key: str) -> dict:
+    if not REQUESTS_OK:
+        raise RuntimeError("requests kütüphanesi kurulu değil")
+    if not api_key:
+        raise ValueError("VirusTotal API anahtarı gerekli.")
+
+    domain = domain.strip()
+    if "://" in domain:
+        domain = urllib.parse.urlparse(domain).netloc
+
+    headers = {"x-apikey": api_key}
+    try:
+        r = requests.get(f"https://www.virustotal.com/api/v3/domains/{domain}", headers=headers, timeout=15)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"VirusTotal API'ye bağlanılamadı: {e}")
+
+    if r.status_code == 401:
+        raise RuntimeError("Geçersiz VirusTotal API anahtarı (401).")
+    if r.status_code == 404:
+        return {"domain": domain, "found": False}
+    if r.status_code == 429:
+        raise RuntimeError("VirusTotal API rate limit aşıldı (429).")
+
+    r.raise_for_status()
+
+    try:
+        data = r.json().get('data', {}).get('attributes', {})
+        data['found'] = True
+        data['domain'] = domain
+    except (json.JSONDecodeError, KeyError):
+        raise RuntimeError("VirusTotal API'den geçersiz JSON yanıtı alındı.")
+    return data
 
 USERNAME_PLATFORMS = [
     ("GitHub",    "https://github.com/{u}",              "not-found-page"),
@@ -601,31 +646,28 @@ def analyze_email(email: str) -> dict:
             except Exception:
                 pass
     return result
-
-def hibp_lookup(email: str, api_key: str = None) -> dict:
+def hibp_lookup(email: str) -> dict:
     """Checks an email against the Have I Been Pwned API."""
     if not REQUESTS_OK:
         raise RuntimeError("requests kütüphanesi kurulu değil")
     email = email.strip()
-    
+
     headers = UA.copy()
-    if api_key:
-        headers["hibp-api-key"] = api_key
-    
+    # HIBP requires a specific user agent if one is sent.
+    headers["User-Agent"] = "GhostOSINT-Framework"
+
     try:
-        # HIBP requires a specific user agent if one is sent
-        headers["User-Agent"] = "GhostOSINT-Framework"
+        # The public API without a key has a rate limit.
+        # Repeated fast queries will get a 429 error.
         r = requests.get(f"https://haveibeenpwned.com/api/v3/breachedaccount/{urllib.parse.quote(email)}", headers=headers, timeout=15)
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"HIBP API'ye bağlanılamadı: {e}")
 
     if r.status_code == 404:
         return {"pwned": False, "breaches": [], "count": 0}
-    if r.status_code == 401:
-        raise RuntimeError("Geçersiz veya eksik Have I Been Pwned API anahtarı (401).")
     if r.status_code == 429:
-        raise RuntimeError("HIBP API rate limit aşıldı (429). API anahtarı kullanmayı veya bir süre beklemeyi deneyin.")
-    
+        raise RuntimeError("HIBP API rate limit aşıldı (429). Birkaç saniye bekleyip tekrar deneyin.")
+
     r.raise_for_status() # For other errors
 
     try:
@@ -691,6 +733,8 @@ def analyze_url(url: str) -> dict:
         result["punycode"] = final_domain.startswith("xn--") or ".xn--" in final_domain
         try:
             result["ip"] = socket.gethostbyname(final_domain)
+        except socket.gaierror:
+            result["ip"] = "Çözülemedi"
         except Exception:
             pass
     except Exception as e:
@@ -700,7 +744,7 @@ def analyze_url(url: str) -> dict:
 def take_url_screenshot(url: str, save_path: str):
     """Takes a full-page screenshot of a URL using Playwright."""
     if not PLAYWRIGHT_OK:
-        raise RuntimeError("Bu özellik için 'playwright' kütüphanesi gereklidir.\n\nLütfen GhostOSINT.bat dosyasını çalıştırarak kurulumu tamamlayın.")
+        raise RuntimeError("Bu özellik için 'playwright' kütüphanesi gereklidir.\n\nLütfen `GhostOSINT-Installer.bat` dosyasını çalıştırarak kurulumu tamamlayın.")
 
     with sync_playwright() as p:
         try:
@@ -841,12 +885,26 @@ def mac_vendor_lookup(mac: str) -> str:
         raise ValueError("Geçersiz MAC adresi formatı.")
     if not REQUESTS_OK:
         raise RuntimeError("requests kütüphanesi kurulu değil")
-    r = requests.get(f"https://api.macvendors.com/{mac.strip()}", timeout=8)
-    if r.status_code == 200 and r.text.strip():
-        return r.text.strip()
+    # Using the simple, free, and key-less plain-text API from macvendors.com
+    try:
+        # The API expects the MAC address directly in the URL.
+        r = requests.get(f"https://api.macvendors.com/{urllib.parse.quote(mac.strip())}", headers=UA, timeout=8)
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"MAC vendor API'ye bağlanılamadı: {e}")
+
     if r.status_code == 404:
         raise RuntimeError("Üretici bulunamadı (bilinmeyen OUI).")
-    raise RuntimeError(f"Sorgu başarısız (HTTP {r.status_code}), API rate limit olabilir.")
+    if r.status_code == 400:
+        raise RuntimeError("Geçersiz MAC adresi formatı (API'ye göre).")
+
+    r.raise_for_status()
+
+    # The API returns the vendor name as plain text.
+    vendor = r.text.strip()
+    if not vendor or "errors" in vendor.lower():
+        raise RuntimeError(f"Üretici bulunamadı veya API hatası: {vendor}")
+
+    return vendor
 
 
 def parse_user_agent(ua: str) -> dict:
@@ -969,15 +1027,16 @@ def breach_check(email: str) -> dict:
         data = r.json()
     except Exception:
         raise RuntimeError("Servis yanıtı parse edilemedi (rate limit olabilir, sonra tekrar dene).")
-    breaches = data.get("breaches", [])
-    flat = []
-    if breaches:
-        for group in breaches:
-            if isinstance(group, list):
-                flat.extend(group)
-            else:
-                flat.append(group)
-    return {"exposed": bool(flat), "breaches": flat}
+
+    # Handle cases where API returns 200 OK but with an error message in JSON
+    if "Error" in data:
+        return {"exposed": False, "breaches": []}
+
+    breaches_list = data.get("breaches", [])
+    # Extract just the names for cleaner output in the GUI
+    breach_names = sorted([b.get("name", "Bilinmeyen Kaynak") for b in breaches_list]) if breaches_list else []
+
+    return {"exposed": bool(breach_names), "breaches": breach_names}
 
 
 def generate_leak_dorks(term: str) -> dict:
@@ -990,53 +1049,77 @@ def generate_leak_dorks(term: str) -> dict:
         "duckduckgo": f"https://duckduckgo.com/?q=%22{q}%22+({urllib.parse.quote(site_filter)})",
         "google_generic": f"https://www.google.com/search?q=%22{q}%22+leak+OR+breach+OR+dump",
         "github_code": f"https://github.com/search?q=%22{q}%22&type=code",
-        "psbdmp": f"https://psbdmp.ws/api/search/{q}",
+        "paste_archive": f"https://ps.s.osint.sh/s/{q}",
     }
 
-def pastebin_scraper(keyword: str, progress_callback=None) -> list:
+def censor_password(password: str) -> str:
+    """Censors a password, showing only the first 2 and last 2 characters."""
+    if len(password) <= 4:
+        return "****"
+    return password[:2] + "*" * (len(password) - 4) + password[-2:]
+
+
+def leakpeek_lookup(keyword: str) -> dict:
+    """LeakCheck Public API'sini kullanarak sızıntı kaynaklarını sorgular.
+
+    Not: LeakPeek.com artık ücretli üyelik gerektirdiği ve eski (reverse-engineer
+    edilmiş) /api/ endpoint'i kaldırıldığı için, bu modül LeakCheck'in resmi,
+    ücretsiz ve anahtarsız Public API'sine geçirildi (https://leakcheck.io).
+    Public API sadece hangi kaynaklarda / hangi veri kategorilerinde sızıntı
+    bulunduğunu döner; şifre gibi hassas alanları döndürmez (bunun için
+    ücretli Pro API v2 + API key gerekir).
+    """
     if not REQUESTS_OK:
         raise RuntimeError("requests kütüphanesi kurulu değil")
-
-    def report(msg):
-        if progress_callback:
-            progress_callback(msg)
 
     keyword = keyword.strip()
     if not keyword:
         raise ValueError("Arama terimi boş olamaz.")
 
-    report(f"'{keyword}' için psbdmp.ws API'si sorgulanıyor...")
+    api_url = "https://leakcheck.io/api/public"
+    params = {"check": keyword}
+
     try:
-        # psbdmp.ws is a public archive of pastebin pastes
-        r = requests.get(f"https://psbdmp.ws/api/search/{keyword}", headers=UA, timeout=15)
-        r.raise_for_status()
-        data = r.json()
+        r = requests.get(api_url, params=params, headers=UA, timeout=25)
     except requests.exceptions.Timeout:
-        raise RuntimeError("psbdmp.ws zaman aşımına uğradı, daha sonra tekrar deneyin.")
+        raise RuntimeError("LeakCheck API zaman aşımına uğradı, daha sonra tekrar deneyin.")
     except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"psbdmp.ws API sorgusu başarısız: {e}")
+        raise RuntimeError(f"LeakCheck API sorgusu başarısız: {e}")
+
+    if r.status_code == 429:
+        raise RuntimeError("LeakCheck API rate limit aşıldı (429). Lütfen bir süre sonra tekrar deneyin.")
+    if r.status_code == 404:
+        raise RuntimeError("LeakCheck API sorgusu geçersiz (404). Girdiğiniz terim email/username formatında olmalı.")
+    r.raise_for_status()
+
+    try:
+        data = r.json()
     except json.JSONDecodeError:
-        raise RuntimeError("psbdmp.ws API'den geçersiz yanıt alındı.")
+        raise RuntimeError("LeakCheck API'den geçersiz JSON yanıtı alındı.")
 
-    if not data or not data.get("data"):
-        report("psbdmp.ws üzerinde sonuç bulunamadı.")
-        return []
+    if not data.get("success"):
+        msg = data.get("error", data.get("message", "Bilinmeyen bir hata oluştu."))
+        raise RuntimeError(f"LeakCheck API hatası: {msg}")
 
-    paste_ids = [p["id"] for p in data["data"]][:10] # Limit to first 10 results
-    report(f"{len(paste_ids)} potansiyel paste bulundu. İçerikler çekiliyor...")
+    found_count = data.get("found", 0)
+    if not found_count:
+        return {"found": False, "results": [], "count": 0, "fields": []}
 
+    sources = data.get("sources", [])
     results = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(lambda p: requests.get(f"https://pastebin.com/raw/{p}", headers=UA, timeout=10), pid): pid for pid in paste_ids}
-        for future in futures:
-            pid = futures[future]
-            try:
-                r_paste = future.result()
-                if r_paste.status_code == 200:
-                    results.append({"id": pid, "url": f"https://pastebin.com/{pid}", "content": r_paste.text})
-            except Exception:
-                report(f"-> Hata: {pid} çekilemedi.")
-    return results
+    for src in sources:
+        name = src.get("name", "Bilinmeyen Kaynak")
+        date = src.get("date", "Tarih bilinmiyor")
+        results.append({"line": f"{name}  (Tarih: {date})", "sources": name})
+
+    return {
+        "found": True,
+        "results": results,
+        "count": found_count,
+        "fields": data.get("fields", []),
+    }
+
+
 
 # Not: Bu tarayıcı sadece TCP portlarını tarar. UDP taraması (örn. Minecraft Bedrock) şu anki haliyle desteklenmemektedir.
 COMMON_PORTS = {
@@ -1053,7 +1136,11 @@ def scan_common_ports(host: str, timeout=2.0) -> dict:
     try:
         ip = socket.gethostbyname(host)
     except socket.gaierror as e:
-        raise RuntimeError(f"Host çözülemedi: {e}")
+        error_message = (
+            f"Host ('{host}') çözülemedi.\n\n"
+            "Lütfen geçerli bir domain adı veya IP adresi girdiğinizden emin olun."
+        )
+        raise RuntimeError(error_message) from e
 
     def check(port_name):
         port, name = port_name
@@ -1104,7 +1191,7 @@ def sql_injection_test(url: str, progress_callback=None) -> dict:
 
     if not params:
         msg = "URL'de test edilecek parametre bulunamadı."
-        report(msg)
+        report(f"[!] {msg} (Örn: https://site.com/index.php?id=1)")
         return {"vulnerable": False, "details": [], "message": msg}
 
     vulnerabilities = []
@@ -1162,7 +1249,7 @@ def xss_test(url: str, progress_callback=None) -> dict:
 
     if not params:
         msg = "URL'de test edilecek parametre bulunamadı."
-        report(msg)
+        report(f"[!] {msg} (Örn: https://site.com/index.php?q=test)")
         return {"vulnerable": False, "details": [], "message": msg}
 
     vulnerabilities = []
@@ -1389,6 +1476,15 @@ def bin_lookup(bin_number: str) -> dict:
 # ================= GUI =================
 
 class SplashScreen(tk.Toplevel):
+    """
+    Açılış ekranı. Ana pencere yüklenirken gösterilir.
+    """
+    # Not: Bu sınıfın içinde ICON_BASE64'ün global olarak tanımlı olduğu varsayılır.
+    # Ana uygulama bu değişkeni betiğin sonunda tanımlar.
+    # Eğer bu dosya tek başına çalıştırılırsa veya ikon datası eksikse,
+    # try-except bloğu hatayı yakalayıp ikonsuz devam edecektir.
+    # Bu, modülerlik ve potansiyel yeniden kullanılabilirlik için bir tasarım notudur.
+
     def __init__(self, parent):
         tk.Toplevel.__init__(self, parent)
         self.overrideredirect(True)
@@ -1432,6 +1528,16 @@ class SplashScreen(tk.Toplevel):
 
 class GhostOSINT(tk.Tk):
     def __init__(self):
+        # --- Ön Kontrol ---
+        # Temel bağımlılıklar olmadan GUI'yi başlatmanın anlamı yok.
+        if not REQUESTS_OK:
+            # Tkinter'ı başlatmadan önce bir hata mesajı göster
+            root = tk.Tk()
+            root.withdraw() # Ana pencereyi gizle
+            messagebox.showerror("Kritik Hata: Bağımlılık Eksik", "'requests' kütüphanesi bulunamadı.\n\nLütfen `GhostOSINT-Installer.bat` dosyasını çalıştırarak gerekli kurulumları yapın.")
+            root.destroy()
+            return
+
         super().__init__()
         self.withdraw() # Ana pencereyi başlangıçta gizle
 
@@ -1573,9 +1679,13 @@ class GhostOSINT(tk.Tk):
         self.tracked_widgets.append((sep_label, {"bg": "PANEL", "fg": "FG_DIM"}))
 
         deps = []
-        deps.append("requests OK" if REQUESTS_OK else "requests EKSİK")
-        deps.append("dnspython OK" if DNSPYTHON_OK else "dnspython EKSİK")
-        deps.append("phonenumbers OK" if PHONENUMBERS_OK else "phonenumbers EKSİK")
+        # Daha kapsamlı bir bağımlılık özeti
+        dep_map = { "requests": REQUESTS_OK, "dnspython": DNSPYTHON_OK, "phonenumbers": PHONENUMBERS_OK,
+                    "Pillow": PIL_OK, "OpenCV": CV2_OK, "Playwright": PLAYWRIGHT_OK, "PDF": XHTML2PDF_OK }
+        
+        for name, status in dep_map.items():
+            if not status:
+                deps.append(f"{name} EKSİK")
         deps_label = tk.Label(right_frame, text=" | ".join(deps), bg=self.theme["PANEL"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9), anchor="e")
         deps_label.pack(side="right")
         self.tracked_widgets.append((deps_label, {"bg": "PANEL", "fg": "FG_DIM"}))
@@ -1677,8 +1787,40 @@ class GhostOSINT(tk.Tk):
                 result = fn()
                 self.after(0, lambda: on_done(result, None))
             except Exception as e:
-                self.after(0, lambda: on_done(None, e))
+                self.after(0, lambda e=e: on_done(None, e))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _format_error_message(self, err: Exception) -> str:
+        """Formats common exceptions into user-friendly messages."""
+        err_str = str(err)
+        
+        # 1. Handle requests' ConnectionError for DNS issues
+        if (isinstance(err, requests.exceptions.ConnectionError) and 
+            ('getaddrinfo failed' in err_str.lower() or "name or service not known" in err_str.lower())):
+            match = re.search(r"host='([^']*)'", err_str)
+            host = match.group(1) if match else "belirtilen host"
+            return (
+                f"Host ('{host}') çözülemedi veya ulaşılamadı.\n\n"
+                "Bu hata genellikle şu nedenlerden kaynaklanır:\n"
+                " - Domain/IP adresi yanlış yazılmış.\n"
+                " - Domain adı mevcut değil veya süresi dolmuş.\n"
+                " - İnternet bağlantınızda veya DNS ayarlarınızda bir sorun var."
+            )
+
+        # 2. Handle our custom RuntimeErrors for socket issues (already user-friendly)
+        if isinstance(err, RuntimeError) and "Host" in err_str and "çözülemedi" in err_str:
+            return err_str
+
+        # 3. Handle generic Timeout
+        if isinstance(err, (requests.exceptions.Timeout, socket.timeout)):
+            return "İstek zaman aşımına uğradı. Sunucu yavaş, ulaşılamıyor veya bir firewall tarafından engelleniyor olabilir."
+
+        # 4. Handle other common request errors
+        if isinstance(err, requests.exceptions.RequestException):
+            return f"Bir ağ/bağlantı hatası oluştu.\n\nDetay: {err}"
+
+        # 5. Default fallback for other exceptions
+        return str(err)
 
     def _check_for_updates(self):
         """Güncelleme kontrolünü arka planda çalıştırır."""
@@ -2254,7 +2396,7 @@ class GhostOSINT(tk.Tk):
             self.tab_results.setdefault("DISCORD ID", {"input": raw})["snowflake"] = info
             self.set_status("Snowflake decode tamamlandı.")
         except Exception as e:
-            messagebox.showerror("Hata", str(e))
+            messagebox.showerror("Hata", self._format_error_message(e))
 
     def _on_discord_api(self):
         raw_id = self.discord_id_entry.get().strip()
@@ -2272,7 +2414,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("Hata oluştu.")
                 return
             out = (
@@ -2292,21 +2434,6 @@ class GhostOSINT(tk.Tk):
 
         self._run_async(task, done)
 
-    def _save_shodan_key(self):
-        key = self.shodan_key_entry.get().strip()
-        self.app_config["shodan_api_key"] = key
-        save_config(self.app_config)
-        self.set_status("Shodan API anahtarı kaydedildi.")
-        # Enable/disable button based on key presence
-        state = "normal" if key else "disabled"
-        self.shodan_lookup_button.config(state=state)
-
-    def _save_hibp_key(self):
-        key = self.hibp_key_entry.get().strip()
-        self.app_config["hibp_api_key"] = key
-        save_config(self.app_config)
-        self.set_status("Have I Been Pwned API anahtarı kaydedildi.")
-
     # ================= IP TAB =================
     def _build_ip_tab(self):
         t = self.tab_ip
@@ -2314,77 +2441,8 @@ class GhostOSINT(tk.Tk):
         ttk.Button(t, text="IP SORGULA (ip-api.com)", command=self._on_ip_lookup).pack(anchor="w", pady=6)
         
         # Separator
-        l_sep = tk.Label(t, text="─── Shodan Entegrasyonu ───", bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9))
-        l_sep.pack(fill="x", pady=(14, 2))
-        self.tracked_widgets.append((l_sep, {"bg": "BG", "fg": "FG_DIM"}))
-
-        # Shodan API Key Entry
-        key_row = tk.Frame(t, bg=self.theme["BG"])
-        key_row.pack(fill="x", pady=4)
-        self.tracked_widgets.append((key_row, {"bg": "BG"}))
-        l = tk.Label(key_row, text="Shodan API Key:", bg=self.theme["BG"], fg=self.theme["FG"], font=FONT, width=16, anchor="w")
-        l.pack(side="left")
-        self.tracked_widgets.append((l, {"bg": "BG", "fg": "FG"}))
-        self.shodan_key_entry = ttk.Entry(key_row, width=40, font=FONT_MONO, show="*")
-        self.shodan_key_entry.pack(side="left", padx=6, fill="x", expand=True)
-        self.shodan_key_entry.insert(0, self.app_config.get("shodan_api_key", ""))
-        
-        ttk.Button(key_row, text="Anahtarı Kaydet", command=self._save_shodan_key, style="Clear.TButton").pack(side="right", padx=(0, 6))
-
-        # Shodan Lookup Button
-        self.shodan_lookup_button = ttk.Button(t, text="SHODAN SORGULA", style="Blue.TButton", command=self._on_shodan_lookup)
-        self.shodan_lookup_button.pack(anchor="w", pady=6)
-        
-        # Initial state of the button
-        if not self.shodan_key_entry.get():
-            self.shodan_lookup_button.config(state="disabled")
 
         self.ip_output = self._output_box(t, tab_name="IP LOOKUP")
-
-    def _on_shodan_lookup(self):
-        ip = self.ip_entry.get().strip()
-        api_key = self.shodan_key_entry.get().strip()
-        if not ip:
-            messagebox.showerror("Hata", "IP adresi girin.")
-            return
-        if not api_key:
-            messagebox.showerror("Hata", "Shodan API anahtarı girin ve kaydedin.")
-            return
-        
-        self.set_status(f"Shodan'da '{ip}' sorgulanıyor...")
-        self._write(self.ip_output, f"Shodan'da '{ip}' sorgulanıyor, lütfen bekleyin...\n")
-
-        def done(result, err):
-            if err:
-                messagebox.showerror("Hata", str(err))
-                self.set_status("Shodan sorgusu başarısız.")
-                return
-            
-            ports = "\n  ".join(str(p) for p in result.get("ports", [])) or "Yok"
-            vulns = "\n  ".join(v for v in result.get("vulns", [])) or "Yok"
-            hostnames = "\n  ".join(h for h in result.get("hostnames", [])) or "Yok"
-            domains = "\n  ".join(d for d in result.get("domains", [])) or "Yok"
-
-            out = (
-                f"[SHODAN HOST LOOKUP: {result.get('ip')}]\n"
-                f"Organizasyon: {result.get('organization')}\n"
-                f"OS          : {result.get('os')}\n"
-                f"ISP         : {result.get('isp')}\n"
-                f"ASN         : {result.get('asn')}\n"
-                f"Konum       : {result.get('location')}\n"
-                f"Son Güncelleme: {result.get('last_update')}\n"
-                f"Etiketler   : {', '.join(result.get('tags', [])) or 'Yok'}\n\n"
-                f"Hostnames:\n  {hostnames}\n\n"
-                f"Domains:\n  {domains}\n\n"
-                f"Açık Portlar:\n  {ports}\n\n"
-                f"Bilinen Zafiyetler (CVEs):\n  {vulns}\n\n"
-                f"Detaylı bilgi için: https://www.shodan.io/host/{result.get('ip')}\n"
-            )
-            self._write(self.ip_output, out)
-            self.tab_results.setdefault("IP LOOKUP", {"input": ip})["shodan"] = result
-            self.set_status("Shodan sorgusu tamamlandı.")
-
-        self._run_async(lambda: shodan_lookup(ip, api_key), done)
 
     def _on_ip_lookup(self):
         ip = self.ip_entry.get().strip()
@@ -2395,7 +2453,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("Hata oluştu.")
                 return
             out = (
@@ -2438,7 +2496,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 return
             a = "\n  ".join(result["A"]) or "Bulunamadı"
             mx = "\n  ".join(result["MX"]) or ("Bulunamadı" if DNSPYTHON_OK else "(dnspython kurulu değil)")
@@ -2460,13 +2518,156 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 return
             self._write(self.domain_output, result)
             self.tab_results.setdefault("DOMAIN / DNS", {"input": domain})["whois"] = result
             self.set_status("WHOIS sorgu tamamlandı.")
 
         self._run_async(lambda: whois_lookup(domain), done)
+
+    # ================= REPUTATION TAB =================
+    def _save_abuseipdb_key(self):
+        key = self.abuseipdb_key_entry.get().strip()
+        self.app_config["abuseipdb_api_key"] = key
+        save_config(self.app_config)
+        self.set_status("AbuseIPDB API anahtarı kaydedildi.")
+
+    def _save_virustotal_key(self):
+        key = self.virustotal_key_entry.get().strip()
+        self.app_config["virustotal_api_key"] = key
+        save_config(self.app_config)
+        self.set_status("VirusTotal API anahtarı kaydedildi.")
+
+    def _build_reputation_tab(self):
+        t = self.tab_reputation
+        self.reputation_entry = self._labeled_entry(t, "IP / Domain:")
+        ttk.Button(t, text="İTİBAR SORGULA", command=self._on_reputation_lookup).pack(anchor="w", pady=6)
+
+        l_sep = tk.Label(t, text="─── API Anahtarları ───", bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9))
+        l_sep.pack(fill="x", pady=(14, 2))
+        self.tracked_widgets.append((l_sep, {"bg": "BG", "fg": "FG_DIM"}))
+
+        # AbuseIPDB API Key
+        key_row1 = tk.Frame(t, bg=self.theme["BG"])
+        key_row1.pack(fill="x", pady=4)
+        self.tracked_widgets.append((key_row1, {"bg": "BG"}))
+        l1 = tk.Label(key_row1, text="AbuseIPDB API Key:", bg=self.theme["BG"], fg=self.theme["FG"], font=FONT, width=18, anchor="w")
+        l1.pack(side="left")
+        self.tracked_widgets.append((l1, {"bg": "BG", "fg": "FG"}))
+        self.abuseipdb_key_entry = ttk.Entry(key_row1, width=40, font=FONT_MONO, show="*")
+        self.abuseipdb_key_entry.pack(side="left", padx=6, fill="x", expand=True)
+        self.abuseipdb_key_entry.insert(0, self.app_config.get("abuseipdb_api_key", ""))
+        ttk.Button(key_row1, text="Kaydet", command=self._save_abuseipdb_key, style="Clear.TButton").pack(side="right", padx=(0, 6))
+
+        # VirusTotal API Key
+        key_row2 = tk.Frame(t, bg=self.theme["BG"])
+        key_row2.pack(fill="x", pady=4)
+        self.tracked_widgets.append((key_row2, {"bg": "BG"}))
+        l2 = tk.Label(key_row2, text="VirusTotal API Key:", bg=self.theme["BG"], fg=self.theme["FG"], font=FONT, width=18, anchor="w")
+        l2.pack(side="left")
+        self.tracked_widgets.append((l2, {"bg": "BG", "fg": "FG"}))
+        self.virustotal_key_entry = ttk.Entry(key_row2, width=40, font=FONT_MONO, show="*")
+        self.virustotal_key_entry.pack(side="left", padx=6, fill="x", expand=True)
+        self.virustotal_key_entry.insert(0, self.app_config.get("virustotal_api_key", ""))
+        ttk.Button(key_row2, text="Kaydet", command=self._save_virustotal_key, style="Clear.TButton").pack(side="right", padx=(0, 6))
+
+        self.reputation_output = self._output_box(t, tab_name="İTİBAR KONTROLÜ")
+
+    def _on_reputation_lookup(self):
+        target = self.reputation_entry.get().strip()
+        if not target:
+            messagebox.showerror("Hata", "IP adresi veya domain girin.")
+            return
+
+        is_ip = re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", target) or ':' in target
+
+        if is_ip:
+            api_key = self.abuseipdb_key_entry.get().strip()
+            if not api_key:
+                messagebox.showerror("Hata", "IP itibarı için AbuseIPDB API anahtarı gereklidir.")
+                return
+            self.set_status(f"AbuseIPDB'de '{target}' sorgulanıyor...")
+            self._write(self.reputation_output, f"AbuseIPDB'de '{target}' sorgulanıyor, lütfen bekleyin...\n")
+
+            def done(result, err):
+                if err:
+                    messagebox.showerror("Hata", self._format_error_message(err))
+                    self.set_status("AbuseIPDB sorgusu başarısız.")
+                    return
+                
+                score = result.get('abuseConfidenceScore', 0)
+                score_color = "KÖTÜ ✗" if score > 50 else ("ŞÜPHELİ ⚠" if score > 0 else "TEMİZ ✓")
+                out = (
+                    f"[ABUSEIPDB RAPORU: {result.get('ipAddress')}]\n"
+                    f"İtibar Skoru      : {score}% ({score_color})\n"
+                    f"IP Versiyonu      : IPv{result.get('ipVersion')}\n"
+                    f"Kullanım Tipi     : {result.get('usageType') or '-'}\n"
+                    f"Domain            : {result.get('domain') or '-'}\n"
+                    f"ISP               : {result.get('isp') or '-'}\n"
+                    f"Ülke              : {result.get('countryName')} ({result.get('countryCode')})\n"
+                    f"Whitelist'te mi?  : {'Evet' if result.get('isWhitelisted') else 'Hayır'}\n"
+                    f"Toplam Rapor Sayısı: {result.get('totalReports', 0)}\n"
+                    f"Farklı Raporlayan : {result.get('numDistinctUsers', 0)}\n"
+                    f"Son Rapor Tarihi  : {result.get('lastReportedAt') or '-'}\n\n"
+                    f"Detaylı bilgi için: https://www.abuseipdb.com/check/{result.get('ipAddress')}\n"
+                )
+                self._write(self.reputation_output, out)
+                self.tab_results.setdefault("İTİBAR KONTROLÜ", {"input": target})["abuseipdb"] = result
+                self.set_status("AbuseIPDB sorgusu tamamlandı.")
+
+            self._run_async(lambda: abuseipdb_check(target, api_key), done)
+        else:
+            api_key = self.virustotal_key_entry.get().strip()
+            if not api_key:
+                messagebox.showerror("Hata", "Domain itibarı için VirusTotal API anahtarı gereklidir.")
+                return
+            self.set_status(f"VirusTotal'de '{target}' sorgulanıyor...")
+            self._write(self.reputation_output, f"VirusTotal'de '{target}' sorgulanıyor, lütfen bekleyin...\n")
+
+            def done(result, err):
+                if err:
+                    messagebox.showerror("Hata", self._format_error_message(err))
+                    self.set_status("VirusTotal sorgusu başarısız.")
+                    return
+
+                if not result.get('found'):
+                    out = f"[VIRUSTOTAL RAPORU: {target}]\n\nVirusTotal veritabanında bu domain için bir kayıt bulunamadı."
+                    self._write(self.reputation_output, out)
+                    self.set_status("VirusTotal sorgusu tamamlandı (kayıt yok).")
+                    return
+
+                stats = result.get('last_analysis_stats', {})
+                malicious = stats.get('malicious', 0)
+                suspicious = stats.get('suspicious', 0)
+                total_vendors = sum(stats.values())
+                
+                status = "TEMİZ ✓"
+                if malicious > 0:
+                    status = "ZARARLI ✗"
+                elif suspicious > 0:
+                    status = "ŞÜPHELİ ⚠"
+
+                last_analysis_date_str = (datetime.fromtimestamp(result.get('last_analysis_date', 0)).strftime('%Y-%m-%d %H:%M:%S')
+                                          if result.get('last_analysis_date') else '-')
+
+                out = (
+                    f"[VIRUSTOTAL RAPORU: {result.get('domain')}]\n"
+                    f"Genel Durum       : {status}\n"
+                    f"Tespit Oranı      : {malicious + suspicious} / {total_vendors}\n"
+                    f"  - Zararlı       : {malicious}\n"
+                    f"  - Şüpheli       : {suspicious}\n"
+                    f"  - Zararsız      : {stats.get('harmless', 0)}\n"
+                    f"  - Tespit Edilemedi: {stats.get('undetected', 0)}\n"
+                    f"Son Analiz Tarihi : {last_analysis_date_str}\n"
+                    f"Popülerlik Sırası : {result.get('popularity_ranks', {}).get('Alexa', {}).get('rank', '-') or '-' } (Alexa)\n\n"
+                    f"Detaylı bilgi için: https://www.virustotal.com/gui/domain/{result.get('domain')}\n"
+                )
+                self._write(self.reputation_output, out)
+                self.tab_results.setdefault("İTİBAR KONTROLÜ", {"input": target})["virustotal"] = result
+                self.set_status("VirusTotal sorgusu tamamlandı.")
+
+            self._run_async(lambda: virustotal_domain_report(target, api_key), done)
 
     # ================= USERNAME TAB =================
     def _build_username_tab(self):
@@ -2499,7 +2700,7 @@ class GhostOSINT(tk.Tk):
 
         def done(results, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 return
             lines = [f"[USERNAME SEARCH: {username}]\n"]
             for name, status, url in results:
@@ -2523,37 +2724,13 @@ class GhostOSINT(tk.Tk):
         
         ttk.Button(btn_row, text="FORMAT/MX ANALİZ ET", command=self._on_email_analyze).pack(side="left")
 
-        # Separator for HIBP
-        l_sep = tk.Label(t, text="─── Have I Been Pwned (HIBP) Entegrasyonu ───", bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9))
-        l_sep.pack(fill="x", pady=(14, 2))
-        self.tracked_widgets.append((l_sep, {"bg": "BG", "fg": "FG_DIM"}))
-
-        # HIBP API Key Entry
-        key_row = tk.Frame(t, bg=self.theme["BG"])
-        key_row.pack(fill="x", pady=4)
-        self.tracked_widgets.append((key_row, {"bg": "BG"}))
-        l = tk.Label(key_row, text="HIBP API Key:", bg=self.theme["BG"], fg=self.theme["FG"], font=FONT, width=16, anchor="w")
-        l.pack(side="left")
-        self.tracked_widgets.append((l, {"bg": "BG", "fg": "FG"}))
-        self.hibp_key_entry = ttk.Entry(key_row, width=40, font=FONT_MONO, show="*")
-        self.hibp_key_entry.pack(side="left", padx=6, fill="x", expand=True)
-        self.hibp_key_entry.insert(0, self.app_config.get("hibp_api_key", ""))
-        
-        ttk.Button(key_row, text="Anahtarı Kaydet", command=self._save_hibp_key, style="Clear.TButton").pack(side="right", padx=(0, 6))
-
         # HIBP Lookup Button
-        self.hibp_lookup_button = ttk.Button(t, text="HAVE I BEEN PWNED? SORGULA", style="Blue.TButton", command=self._on_hibp_lookup)
-        self.hibp_lookup_button.pack(anchor="w", pady=6)
-        
-        l_hibp_note = tk.Label(t, text="API anahtarı olmadan rate limit çok düşüktür (1 sorgu/2sn). Anahtar https://haveibeenpwned.com/API/Key adresinden alınabilir.", bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9), justify="left")
-        l_hibp_note.pack(anchor="w")
-        self.tracked_widgets.append((l_hibp_note, {"bg": "BG", "fg": "FG_DIM"}))
+        ttk.Button(btn_row, text="HAVE I BEEN PWNED? SORGULA", style="Blue.TButton", command=self._on_hibp_lookup).pack(side="left", padx=8)
 
         self.email_output = self._output_box(t, tab_name="EMAIL")
 
     def _on_hibp_lookup(self):
         email = self.email_entry.get().strip()
-        api_key = self.hibp_key_entry.get().strip()
         if not email:
             messagebox.showerror("Hata", "Email adresi girin.")
             return
@@ -2563,7 +2740,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("HIBP sorgusu başarısız.")
                 return
             
@@ -2583,7 +2760,7 @@ class GhostOSINT(tk.Tk):
             self.tab_results.setdefault("EMAIL", {"input": email})["hibp"] = result
             self.set_status("Have I Been Pwned sorgusu tamamlandı.")
 
-        self._run_async(lambda: hibp_lookup(email, api_key), done)
+        self._run_async(lambda: hibp_lookup(email), done)
 
     def _on_email_analyze(self):
         email = self.email_entry.get().strip()
@@ -2594,7 +2771,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 return
             mx = "\n  ".join(result["mx"]) or ("Bulunamadı" if DNSPYTHON_OK else "(dnspython kurulu değil)")
             a = "\n  ".join(result["a_record"]) or "Bulunamadı"
@@ -2664,7 +2841,7 @@ class GhostOSINT(tk.Tk):
             self.tab_results["PHONE"] = {"input": number, "output": result}
             self.set_status("Telefon sorgusu tamamlandı.")
         except Exception as e:
-            messagebox.showerror("Hata", str(e))
+            messagebox.showerror("Hata", self._format_error_message(e))
 
 
     # ================= URL / QR TAB =================
@@ -2687,7 +2864,7 @@ class GhostOSINT(tk.Tk):
 
     def _on_url_screenshot(self):
         if not PLAYWRIGHT_OK:
-            messagebox.showerror("Hata", "Bu özellik için 'playwright' kütüphanesi gereklidir.\n\nLütfen GhostOSINT.bat dosyasını çalıştırarak kurulumu tamamlayın.")
+            messagebox.showerror("Hata", "Bu özellik için 'playwright' kütüphanesi gereklidir.\n\nLütfen `GhostOSINT-Installer.bat` dosyasını çalıştırarak kurulumu tamamlayın.")
             return
 
         url = self.url_entry.get().strip()
@@ -2710,7 +2887,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result_path, err):
             if err:
-                messagebox.showerror("Hata", f"Ekran görüntüsü alınamadı:\n{err}", parent=self)
+                messagebox.showerror("Hata", f"Ekran görüntüsü alınamadı:\n{self._format_error_message(err)}", parent=self)
                 self.set_status("Ekran görüntüsü alma başarısız.")
                 return
             
@@ -2738,7 +2915,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 return
             chain = "\n  ".join(result["redirect_chain"]) or "Yönlendirme yok"
             out = (
@@ -2773,7 +2950,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("QR okuma başarısız.")
                 return
             self._write(self.url_output, f"[QR KOD SONUCU]\nDosya: {path}\n\nİçerik:\n{result}\n")
@@ -2804,8 +2981,8 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err or result is None:
-                error_message = str(err) if err else "Görsel işlenirken bilinmeyen bir hata oluştu (sonuç alınamadı)."
-                messagebox.showerror("Hata", error_message)
+                error_msg = self._format_error_message(err) if err else "Görsel işlenirken bilinmeyen bir hata oluştu (sonuç alınamadı)."
+                messagebox.showerror("Hata", error_msg)
                 self.set_status("Metadata çıkarma başarısız.")
                 return
 
@@ -2847,7 +3024,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("Sorgu başarısız.")
                 return
             self._write(self.mac_output, f"[MAC VENDOR LOOKUP]\nMAC     : {mac}\nÜretici : {result}\n")
@@ -2913,13 +3090,13 @@ class GhostOSINT(tk.Tk):
             results = []
             with ThreadPoolExecutor(max_workers=20) as executor:
                 futures = {executor.submit(check_subdomain_liveness, sub): sub for sub in self.found_subdomains}
-                for future in concurrent.futures.as_completed(futures):
+                for future in as_completed(futures):
                     results.append(future.result())
             return results
 
         def done(results, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("Subdomain kontrolü başarısız.")
                 self.subdomain_check_button.config(state="normal")
                 return
@@ -2947,7 +3124,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("Subdomain arama başarısız.")
                 self.subdomain_check_button.config(state="disabled")
                 return
@@ -2982,7 +3159,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("Wayback sorgusu başarısız.")
                 return
             out = (
@@ -3016,7 +3193,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("Kontrol başarısız.")
                 return
             if not result["exposed"]:
@@ -3027,6 +3204,10 @@ class GhostOSINT(tk.Tk):
                        f"DİKKAT: Bu email {len(result['breaches'])} bilinen veri ihlalinde bulundu!\n\n"
                        f"İhlaller:\n  - {breaches}\n\n"
                        f"Önerilen: Bu email ile kullandığın şifreleri değiştir ve 2FA aktif et.")
+            
+            out += "\n\n----------------------------------------------------------------\n"
+            out += "İpucu: 'PASTEBIN' sekmesini kullanarak bu email adresi için internete sızdırılmış ham metin (şifre vb.) olup olmadığını da kontrol edebilirsiniz."
+
             self._write(self.breach_output, out)
             self.tab_results["BREACH CHECK"] = {"input": email, "output": result}
             self.set_status("Breach check tamamlandı.")
@@ -3052,7 +3233,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("Port tarama başarısız.")
                 return
             if not result["open_ports"]:
@@ -3093,7 +3274,7 @@ class GhostOSINT(tk.Tk):
             f"DuckDuckGo (paste site.) : {links['duckduckgo']}\n\n"
             f"Google (genel leak/dump) : {links['google_generic']}\n\n"
             f"GitHub Code Search       : {links['github_code']}\n\n"
-            f"psbdmp.ws (paste arşivi) : {links['psbdmp']}\n\n"
+            f"Paste Arşivi (ps.s.osint.sh) : {links['paste_archive']}\n\n"
             f"─────────────────────────────────────────\n"
             f"İpucu: Email için ayrıca BREACH CHECK sekmesini de kullan,\n"
             f"o sekme bilinen ihlal veritabanını otomatik kontrol eder."
@@ -3103,50 +3284,53 @@ class GhostOSINT(tk.Tk):
         self.set_status("Leak search linkleri oluşturuldu.")
 
 
-    # ================= PASTEBIN SCRAPER TAB =================
-    def _build_pastebin_tab(self):
-        t = self.tab_pastebin
-        self.pastebin_entry = self._labeled_entry(t, "Aranacak Terim:")
-        ttk.Button(t, text="PASTEBIN'DE TARA", command=self._on_pastebin_scrape).pack(anchor="w", pady=6)
+    # ================= LEAK PEEK TAB =================
+    def _build_leakpeek_tab(self):
+        t = self.tab_leakpeek
+        self.leakpeek_entry = self._labeled_entry(t, "Email/Username:")
+        ttk.Button(t, text="LEAK PEEK'TE ARA", command=self._on_leakpeek_lookup).pack(anchor="w", pady=6)
         l1 = tk.Label(t,
-                 text="⚠ Bu modül public paste sitelerinden veri çeker. Çıkan sonuçlar hassas bilgiler\n"
+                 text="⚠ Bu modül public veri sızıntılarını tarar. Çıkan sonuçlar hassas bilgiler\n"
                       "içerebilir. Sadece yasal ve etik amaçlarla kullanın.", bg=self.theme["BG"], fg=self.theme["RED"], font=("Segoe UI", 9), justify="left"); l1.pack(anchor="w", pady=(2, 0)); self.tracked_widgets.append((l1, {"bg": "BG", "fg": "RED"}))
-        l2 = tk.Label(t, text="psbdmp.ws API'si ile Pastebin arşivi taranır ve bulunan ilk 10 sonucun içeriği çekilir.",
+        l2 = tk.Label(t, text="LeakCheck.io Public API'si kullanılarak, girilen email/username'in hangi\n"
+                              "sızıntılarda (kaynak + tarih) geçtiği ücretsiz olarak taranır. (Powered by LeakCheck)",
                  bg=self.theme["BG"], fg=self.theme["FG_DIM"], font=("Segoe UI", 9), justify="left"); l2.pack(anchor="w", pady=(2, 0)); self.tracked_widgets.append((l2, {"bg": "BG", "fg": "FG_DIM"}))
-        self.pastebin_output = self._output_box(t, tab_name="PASTEBIN SCRAPER")
+        self.leakpeek_output = self._output_box(t, tab_name="LEAK PEEK")
 
-    def _on_pastebin_scrape(self):
-        keyword = self.pastebin_entry.get().strip()
+    def _on_leakpeek_lookup(self):
+        keyword = self.leakpeek_entry.get().strip()
         if not keyword:
-            messagebox.showerror("Hata", "Aranacak bir terim girin (örn: email, domain, username).")
+            messagebox.showerror("Hata", "Aranacak bir terim girin (örn: email, username).")
             return
-        self.set_status(f"'{keyword}' için Pastebin taranıyor...")
-        self._write(self.pastebin_output, f"Pastebin Taraması Başlatıldı: {keyword}\n" + "="*50 + "\n")
+        self.set_status(f"'{keyword}' için LeakCheck'te arama yapılıyor...")
+        self._write(self.leakpeek_output, f"LeakCheck Taraması Başlatıldı: {keyword}\n" + "="*50 + "\n")
 
-        def progress_callback(message):
-            self.after(0, self._append_to_output, self.pastebin_output, message)
+        def done(result, err):
+            if err:
+                error_message = self._format_error_message(err)
+                messagebox.showerror("Hata", error_message)
+                self.set_status("LeakCheck taraması başarısız.")
+                self._append_to_output(self.leakpeek_output, f"\nHATA: {error_message}")
+                return
 
-        def worker():
-            try:
-                results = pastebin_scraper(keyword, progress_callback=progress_callback)
+            # Başarılı yol: 'result' geçerli bir sözlük (dictionary).
+            self._append_to_output(self.leakpeek_output, "Tarama Tamamlandı.\n" + "="*50)
 
-                def final_update():
-                    progress_callback("\n" + "="*50 + "\nTarama Tamamlandı.")
-                    if not results:
-                        progress_callback(f"Sonuç: '{keyword}' ile ilgili bir paste bulunamadı.")
-                    else:
-                        progress_callback(f"Toplam {len(results)} eşleşen paste bulundu ve içeriği çekildi:\n")
-                        for paste in results:
-                            lines = [f"--- Paste ID: {paste['id']} ---", f"URL: {paste['url']}", "--- İÇERİK (ilk 20 satır) ---", *paste['content'].splitlines()[:20], "----------------------------------\n"]
-                            progress_callback("\n".join(lines))
-                    self.tab_results["PASTEBIN SCRAPER"] = {"input": keyword, "output": results}
-                    self.set_status("Pastebin taraması tamamlandı.")
-                self.after(0, final_update)
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Hata", str(e)))
-                self.after(0, self.set_status, "Pastebin taraması başarısız.")
+            if not result["found"]:
+                self._append_to_output(self.leakpeek_output, f"\nSonuç: '{keyword}' için bilinen sızıntılarda bir kayıt bulunamadı.")
+            else:
+                fields = ", ".join(result.get("fields", [])) or "belirtilmemiş"
+                self._append_to_output(self.leakpeek_output, f"\nDİKKAT: '{keyword}' için {result['count']} sızıntı kaynağı bulundu!\nAçığa çıkan veri kategorileri: {fields}\n")
+                for leak in result["results"]:
+                    self._append_to_output(self.leakpeek_output, f"Kaynak: {leak['line']}\n" + "-"*30)
 
-        threading.Thread(target=worker, daemon=True).start()
+                self._append_to_output(self.leakpeek_output, "\n" + "="*50)
+                self._append_to_output(self.leakpeek_output, "UYARI: Bu terim, listelenen sızıntı veritabanlarında bulundu. İlişkili şifrelerinizi\nDERHAL değiştirmeniz önerilir. (Detaylı veri için LeakCheck Pro API + key gerekir.)\n\nPowered by LeakCheck (leakcheck.io)")
+
+            self.tab_results["LEAK PEEK"] = {"input": keyword, "output": result}
+            self.set_status("LeakCheck taraması tamamlandı.")
+
+        self._run_async(lambda: leakpeek_lookup(keyword), done)
 
     # ================= DISCORD INVITE TAB =================
     def _build_invite_tab(self):
@@ -3166,7 +3350,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("Invite sorgusu başarısız.")
                 return
             out = (
@@ -3206,7 +3390,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("SSL kontrolü başarısız.")
                 return
             san = ", ".join(result["san_list"][:15]) or "-"
@@ -3248,7 +3432,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("IBAN analizi başarısız.")
                 return
 
@@ -3301,7 +3485,7 @@ class GhostOSINT(tk.Tk):
 
         def done(result, err):
             if err:
-                messagebox.showerror("Hata", str(err))
+                messagebox.showerror("Hata", self._format_error_message(err))
                 self.set_status("BIN sorgusu başarısız.")
                 return
 
@@ -3326,7 +3510,7 @@ class GhostOSINT(tk.Tk):
     def _build_xss_tab(self):
         t = self.tab_xss
         self.xss_entry = self._labeled_entry(t, "URL (parametrelerle):", width=70)
-        ttk.Button(t, text="XSS TESTİ YAP", command=self._on_xss_test).pack(anchor="w", pady=6)
+        ttk.Button(t, text="REFLECTED XSS TESTİ YAP", command=self._on_xss_test).pack(anchor="w", pady=6)
         l1 = tk.Label(t, text="⚠ SADECE kendi siteni veya test iznin olan sistemleri tara.\n"
                          "İzinsiz test yapmak yasa dışıdır ve ciddi sonuçları olabilir.", bg=self.theme["BG"], fg=self.theme["RED"], font=("Segoe UI", 9), justify="left"); l1.pack(anchor="w", pady=(2, 0)); self.tracked_widgets.append((l1, {"bg": "BG", "fg": "RED"}))
         l2 = tk.Label(t, text="Bu modül, URL parametrelerine payload ekleyerek sayfada yansıyıp yansımadığını kontrol eder (reflected XSS).",
@@ -3363,8 +3547,8 @@ class GhostOSINT(tk.Tk):
                     self.tab_results["XSS TEST"] = {"input": url, "output": result}
                     self.set_status("XSS testi tamamlandı.")
                 self.after(0, final_update)
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Hata", str(e)))
+            except Exception as e: # Capture exception for lambda
+                self.after(0, lambda e=e: messagebox.showerror("Hata", self._format_error_message(e)))
                 self.after(0, self.set_status, "XSS testi başarısız.")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -3373,7 +3557,7 @@ class GhostOSINT(tk.Tk):
     def _build_sql_tab(self):
         t = self.tab_sql
         self.sql_entry = self._labeled_entry(t, "URL (parametrelerle):", width=70)
-        ttk.Button(t, text="SQLi TESTİ YAP", command=self._on_sql_test).pack(anchor="w", pady=6)
+        ttk.Button(t, text="ERROR-BASED SQLi TESTİ YAP", command=self._on_sql_test).pack(anchor="w", pady=6)
         l1 = tk.Label(t, text="⚠ SADECE kendi siteni veya test iznin olan sistemleri tara.\n"
                          "İzinsiz test yapmak yasa dışıdır ve ciddi sonuçları olabilir.", bg=self.theme["BG"], fg=self.theme["RED"], font=("Segoe UI", 9), justify="left"); l1.pack(anchor="w", pady=(2, 0)); self.tracked_widgets.append((l1, {"bg": "BG", "fg": "RED"}))
         l2 = tk.Label(t, text="Bu modül, URL parametrelerine payload ekleyerek hata mesajı arar (error-based).",
@@ -3409,8 +3593,8 @@ class GhostOSINT(tk.Tk):
                     self.tab_results["SQLi TEST"] = {"input": url, "output": result}
                     self.set_status("SQLi testi tamamlandı.")
                 self.after(0, final_update)
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Hata", str(e)))
+            except Exception as e: # Capture exception for lambda
+                self.after(0, lambda e=e: messagebox.showerror("Hata", self._format_error_message(e)))
                 self.after(0, self.set_status, "SQLi testi başarısız.")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -3500,5 +3684,10 @@ class GhostOSINT(tk.Tk):
         self.set_status("Bitcoin block explorer linki oluşturuldu.")
 
 if __name__ == "__main__":
+    # Ana uygulama nesnesini oluşturmadan önce temel kontroller yapılabilir.
+    # __init__ içine taşıdım, böylece nesne hiç oluşmaz.
     app = GhostOSINT()
-    app.mainloop()
+    # Eğer __init__ içinde bir erken çıkış (return) olduysa, app.title gibi bir attribute
+    # mevcut olmayabilir. Bu yüzden app'in bir 'title' attribute'u olup olmadığını kontrol et.
+    if hasattr(app, "title"):
+        app.mainloop()
